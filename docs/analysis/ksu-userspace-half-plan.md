@@ -150,11 +150,16 @@ batch is out of scope and must be redesigned.
 
 - [x] 批次 0 — probe implemented in `9485531`, CI `43692621460` green, APK
       `597b98ed…551cdb` installed on the device at 16:16
-- [x] 批次 0 — **root obtained with this build** (operator-confirmed 2026-11-15, the 16:19 run). No
-      third-party module was involved; the run was this APK's own `GUARD-UNLOAD` block.
-- [ ] 批次 0 — gate record needs the run's own lines: `GUARD-BEFORE …`, `GUARD-UNLOAD rc1=… rc2=…
-      after=…` and `SU-PROBE-RC=…`. They go to the run's stdout, which lives in the app's private
-      files dir; neither the drained kernel log nor `/data/local/tmp` carries them.
+- [x] 批次 0 — **unload verified**: run `20261115-164233` logs
+      `GUARD-UNLOAD rc1=0 rc2=0 before=2 after=0` with `cap=000001ffffffffff`,
+      `modules_disabled=0`. Both modules really left `/proc/modules`.
+- [ ] 批次 0 — **`su` after an unload is still unproven.** The 16:42 run unloaded the guard but its
+      late-load failed (`seen=absent`, no `KernelSU: welcome`), so `su=absent` and the app's
+      `RESULT=FAIL` is accurate about KernelSU — not a false negative. The 16:19 run reached
+      `KernelSU: welcome` and unloaded the same modules, but its stdout log was not captured.
+- [ ] 批次 0b — **move the unload after `wait_ksu_ready`** so a single run can hold "KernelSU up" and
+      "detector gone" at once, making `SU-PROBE` a real test. Running it before the late-load leaves
+      the two conditions in different runs.
 - [ ] 批次 1 — probe run and read the layout names (may be moot: if `su` works, the manager installs
       the userspace half itself)
 - [ ] 批次 2 — install block
