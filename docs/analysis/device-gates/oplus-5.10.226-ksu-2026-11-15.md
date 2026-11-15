@@ -1,8 +1,9 @@
 # OPlus 5.10.226 KernelSU handoff — device gate (2026-11-15) — chain PASS, root BLOCKED
 
-Branch `main` @ `94880fd` (this fork's own line, not `document`). Nine device runs across
-`20261115-095715` … `20261115-153500`; the last three were driven by the in-app probe stage
-(`guard_probe`), which copies the vendor modules and guard artifacts out of the root shell.
+Branch `main` @ `24f0e1c` (this fork's own line, not `document`). Eight device runs on 2026-11-15: the
+first six are archived in the app's run folders `20261115-095715` … `20261115-140030`, and the last
+two (≈15:03 and ≈15:35) were driven by the in-app probe stage (`guard_probe`), which copies the vendor
+modules and guard artifacts out of the root shell.
 
 ## Device and entry
 
