@@ -437,6 +437,49 @@ namespace ghostlock::attack {
             "  echo \"KSU-READY seen=$KSU_SEEN boot=$KSU_BOOT install=$KSU_INSTALL attempts=$i su=$KSU_SU_PRESENT\"\n"
             "  echo \"[*] ksu readiness seen=$KSU_SEEN boot=$KSU_BOOT install=$KSU_INSTALL attempts=$i su=$KSU_SU_PRESENT\" >>\"$LOG\"\n"
             "}\n"
+            /* The init window is ~0.3 s and the enforcing flip closes dmesg for
+             * good. Sample tightly right after the exec: the throne tracker runs
+             * before setenforce(true), so the last successful sample carries the
+             * crown lines. */
+            "ksu_capture() {\n"
+            "  n=0; miss=0\n"
+            "  while [ \"$n\" -lt 20 ]; do\n"
+            "    n=$((n + 1))\n"
+            "    if timeout 2 dmesg 2>/dev/null | tail -n 1200 >\"$KMSG_MIRROR.new\" 2>/dev/null && [ -s \"$KMSG_MIRROR.new\" ]; then\n"
+            "      mv \"$KMSG_MIRROR.new\" \"$KMSG_MIRROR\" 2>/dev/null\n"
+            "      if [ \"$KMSG_LOG\" != \"$KMSG_MIRROR\" ]; then cp \"$KMSG_MIRROR\" \"$KMSG_LOG\" 2>/dev/null; fi\n"
+            "      miss=0\n"
+            "    else\n"
+            "      miss=$((miss + 1))\n"
+            "      [ \"$miss\" -ge 3 ] && break\n"
+            "    fi\n"
+            "    sleep 0.1\n"
+            "  done\n"
+            "  KSU_BOOT=0; ksu_booted && KSU_BOOT=1\n"
+            "  echo \"KSU-CAPTURE samples=$n miss=$miss boot=$KSU_BOOT\"\n"
+            "}\n"
+            /* The crown compares the manager APK's signing certificate against a
+             * hash compiled into the module. `ksud debug get-sign` is pure
+             * userspace, so this answers "will the crown fail?" without the
+             * kernel log. Run it before the late-load, while the shell can still
+             * exec a copy in /data/local/tmp. */
+            "ksu_mgr_sign() {\n"
+            "  mgr_apk=\"\"\n"
+            "  for p in me.weishu.kernelsu.pr me.weishu.kernelsu com.rifsxd.ksunext com.resukisu.resukisu org.bakasu.bakasu com.kowx712.supermanager; do\n"
+            "    mgr_apk=$(find /data/app -path \"*/$p-*/base.apk\" 2>/dev/null | head -1)\n"
+            "    [ -n \"$mgr_apk\" ] && break\n"
+            "  done\n"
+            "  if [ -z \"$mgr_apk\" ]; then echo 'KSU-MGRSIGN apk=none'; return 0; fi\n"
+            "  tmp=/data/local/tmp/ghostlock-ksud-$$\n"
+            "  if cp /data/adb/ksud \"$tmp\" 2>/dev/null || cp \"$KSUD\" \"$tmp\" 2>/dev/null; then\n"
+            "    chmod 755 \"$tmp\" 2>/dev/null\n"
+            "    sig=$(\"$tmp\" debug get-sign \"$mgr_apk\" 2>&1 | tail -n 1)\n"
+            "    rm -f \"$tmp\" 2>/dev/null\n"
+            "    echo \"KSU-MGRSIGN apk=$mgr_apk $sig\"\n"
+            "  else\n"
+            "    echo 'KSU-MGRSIGN copy-failed'\n"
+            "  fi\n"
+            "}\n"
             "if [ \"$(id -u)\" -ne 0 ]; then\n"
             "  echo '[!] temp su unavailable; aborting' >>\"$LOG\"\n"
             "  restore_enforce not-root\n"
@@ -565,9 +608,11 @@ namespace ghostlock::attack {
              * into the run folder only while that still succeeds. */
             "  ( while kill -0 $$ 2>/dev/null; do\n"
             /* 1200 lines: the OPlus kernel logs bursts of madvise/CHP noise, and
-             * the KernelSU banner must still be inside the window when the
-             * enforcing flip stops the drain from reaching dmesg at all. */
-            "      if timeout 2 dmesg 2>/dev/null | tail -n 1200 >\"$KMSG_MIRROR.new\" 2>/dev/null; then\n"
+             * the KernelSU banner must still be inside the window. The -s test
+             * is load-bearing: once enforcing, dmesg fails but the pipeline
+             * still exits 0 through tail, and an empty file would clobber the
+             * last good snapshot (measured 2026-11-15). */
+            "      if timeout 2 dmesg 2>/dev/null | tail -n 1200 >\"$KMSG_MIRROR.new\" 2>/dev/null && [ -s \"$KMSG_MIRROR.new\" ]; then\n"
             "        mv \"$KMSG_MIRROR.new\" \"$KMSG_MIRROR\" 2>/dev/null\n"
             "        if [ \"$KMSG_LOG\" != \"$KMSG_MIRROR\" ]; then cp \"$KMSG_MIRROR\" \"$KMSG_LOG\" 2>/dev/null; fi\n"
             "      fi\n"
@@ -747,6 +792,8 @@ namespace ghostlock::attack {
             "  fi\n"
             "  echo \"[*] late-load kmi=$KMI\" >>\"$LOG\"\n"
             "  dump_debug\n"
+            /* Runs while SELinux is still permissive and needs no kernel log. */
+            "  ksu_mgr_sign\n"
             /* Samsung DEFEX safeplace and OPlus ROOTCHECK both kill a root exec
              * of a /data binary. Use the lmkd bind-mount path first when the
              * vendor gate is visible; otherwise try the direct exec and fall
@@ -774,6 +821,7 @@ namespace ghostlock::attack {
             "  while [ \"$KSU_ATTEMPT\" -lt 2 ]; do\n"
             "    KSU_ATTEMPT=$((KSU_ATTEMPT + 1))\n"
             "    run_late_load \"$LATE_LOAD_MODE\"\n"
+            "    ksu_capture\n"
             "    for i in $(seq 1 40); do\n"
             "      ks_s=$(ksu_state)\n"
             "      [ \"$ks_s\" = Live ] && KSU_SEEN=Live\n"
