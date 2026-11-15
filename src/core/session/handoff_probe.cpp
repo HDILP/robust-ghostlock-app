@@ -55,11 +55,30 @@ namespace ghostlock::session {
         }
     } // namespace
 
+    std::string_view module_state(std::string_view line) noexcept {
+        size_t pos = 0;
+        for (uint32_t field = 0; field < 4U; ++field) {
+            pos = line.find_first_not_of(" \t", pos);
+            if (pos == std::string_view::npos) return {};
+            pos = line.find_first_of(" \t", pos);
+            if (pos == std::string_view::npos) return {};
+        }
+        pos = line.find_first_not_of(" \t", pos);
+        if (pos == std::string_view::npos) return {};
+        const size_t end = line.find_first_of(" \t", pos);
+        return line.substr(pos, end == std::string_view::npos ? end : end - pos);
+    }
+
     bool kernelsu_module_visible() noexcept {
         bool loaded = false;
         for_each_line("/proc/modules", [&loaded](std::string_view line) {
             const size_t end = line.find_first_of(" \t");
-            if (line.substr(0, end) == "kernelsu") loaded = true;
+            if (line.substr(0, end) != "kernelsu") return;
+            const std::string_view state = module_state(line);
+            /* "Loading"/"Unloading" are transient. An unparseable line keeps
+             * the legacy name-only behaviour on kernels with a different
+             * /proc/modules layout. */
+            loaded = state == "Live" || (state != "Loading" && state != "Unloading");
         });
         return loaded;
     }

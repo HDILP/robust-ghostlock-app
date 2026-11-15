@@ -348,6 +348,61 @@ namespace ghostlock::attack {
              * where a $LOG write does not. */
             "  echo \"ENFORCE-RESTORE reason=$e_reason before=${e_before:-unreadable} wrote=$e_wrote readback=${e_after:-unreadable}\"\n"
             "}\n"
+            /* /proc/modules lists a module as soon as init_module() inserts it,
+             * with state "Loading" (MODULE_STATE_COMING). A name-only grep
+             * therefore reports success while kernelsu_init() is still running.
+             * Read the state field (field 5) instead. */
+            "ksu_state() {\n"
+            "  ksu_line=$(grep '^kernelsu[[:space:]]' /proc/modules 2>/dev/null | head -1 | tr -s ' ' | cut -d' ' -f5)\n"
+            "  echo \"${ksu_line:-absent}\"\n"
+            "}\n"
+            "ksu_live() { [ \"$(ksu_state)\" = Live ]; }\n"
+            /* OPlus/Realme ROOTCHECK (oplus_security_guard / secure_harden)
+             * kills a root execve of an app-owned file under /data:
+             * "execve_block", exit 137, "exited with preempt_count 1". The
+             * direct ksud exec cannot work there, so start with the bind mount.
+             * The detection is by kernel features, not by a device list. */
+            "oem_exec_gate() {\n"
+            "  grep -qE '^oplus_(security_guard|secure_harden)[[:space:]]' /proc/modules 2>/dev/null && return 0\n"
+            "  grep -q 'oplusboot' /proc/cmdline 2>/dev/null && return 0\n"
+            "  return 1\n"
+            "}\n"
+            /* ksud late-load daemonizes (double fork) and returns to this shell
+             * before the module is loaded. Its grandchild then installs the
+             * userspace half, applies sepolicy rules, runs the stage scripts and
+             * restarts the manager. Wait for both halves, not just the name. */
+            "run_late_load() {\n"
+            "  ll_mode=$1\n"
+            "  if [ \"$ll_mode\" = mount ]; then\n"
+            "    umount -l /system/bin/lmkd 2>/dev/null\n"
+            "    if ! mount --bind \"$KSUD\" /system/bin/lmkd 2>>\"$LOG\"; then\n"
+            "      echo '[!] /system/bin/lmkd bind mount unavailable' >>\"$LOG\"\n"
+            "      return 1\n"
+            "    fi\n"
+            "    echo 'KSU-PHASE late-load-mount'\n"
+            "    /system/bin/lmkd late-load --kmi \"$KMI\" --allow-shell >>\"$LOG\" 2>&1\n"
+            "    echo \"[*] mounted late-load exit=$?\" >>\"$LOG\"\n"
+            "  else\n"
+            "    echo \"KSU-PHASE late-load-direct kmi=$KMI\"\n"
+            "    chmod 755 \"$KSUD\" 2>/dev/null\n"
+            "    \"$KSUD\" late-load --kmi \"$KMI\" --allow-shell >>\"$LOG\" 2>&1\n"
+            "    echo \"[*] late-load exit=$?\" >>\"$LOG\"\n"
+            "  fi\n"
+            "  return 0\n"
+            "}\n"
+            "wait_ksu_ready() {\n"
+            "  KSU_STATE=absent\n"
+            "  KSU_INSTALL=0\n"
+            "  for i in $(seq 1 120); do\n"
+            "    KSU_STATE=$(ksu_state)\n"
+            "    if [ \"$KSU_STATE\" = Live ] && [ -e /data/adb/ksud ]; then\n"
+            "      KSU_INSTALL=1\n"
+            "      break\n"
+            "    fi\n"
+            "    sleep 0.1\n"
+            "  done\n"
+            "  echo \"[*] ksu readiness state=$KSU_STATE install=$KSU_INSTALL attempts=$i su=$([ -e /data/adb/ksu/bin/su ] && echo present || echo absent)\" >>\"$LOG\"\n"
+            "}\n"
             "if [ \"$(id -u)\" -ne 0 ]; then\n"
             "  echo '[!] temp su unavailable; aborting' >>\"$LOG\"\n"
             "  restore_enforce not-root\n"
@@ -616,9 +671,9 @@ namespace ghostlock::attack {
 
             "if [ \"$FIXUP_RC\" -eq 0 ]; then\n"
             "# load_policy ok: late-load (module init re-enforces); already-loaded restores below\n"
-            "if grep -q kernelsu /proc/modules 2>/dev/null; then\n"
+            "if ksu_live; then\n"
             "  KSU_ALREADY=1\n"
-            "  echo \"[*] kernelsu already loaded; skipping late-load\" >>\"$LOG\"\n"
+            "  echo \"[*] kernelsu already live; skipping late-load\" >>\"$LOG\"\n"
             "else\n"
             "  KSU_ALREADY=0\n"
             "  if [ ! -x \"$KSUD\" ]; then\n"
@@ -630,51 +685,81 @@ namespace ghostlock::attack {
             "  fi\n"
             "  echo \"[*] late-load kmi=$KMI\" >>\"$LOG\"\n"
             "  dump_debug\n"
-            "  echo \"KSU-PHASE late-load-direct kmi=$KMI\"\n"
-            "  chmod 755 \"$KSUD\" 2>/dev/null\n"
-            "  \"$KSUD\" late-load --kmi \"$KMI\" --allow-shell >>\"$LOG\" 2>&1\n"
-            "  KSU_LOAD_RC=$?\n"
-            "  echo \"[*] late-load exit=$KSU_LOAD_RC\" >>\"$LOG\"\n"
-            /* Samsung DEFEX safeplace kills a root exec of a /data binary
-             * (ksud) before it can load the module. Retry the same exec with
-             * the binary bind-mounted over a whitelisted system path: DEFEX
-             * sees /system/bin/lmkd, ksud runs, and the module is loaded from
-             * ksud's embedded asset. The mount is detached immediately after
-             * the call; lmkd never re-execs, so the window is inert. */
-            "  KSU_NOW=0\n"
-            "  for i in $(seq 1 20); do\n"
-            "    if grep -q kernelsu /proc/modules 2>/dev/null; then KSU_NOW=1; break; fi\n"
-            "    sleep 0.1\n"
-            "  done\n"
-            "  if [ \"$KSU_NOW\" -ne 1 ]; then\n"
-            "    echo '[*] late-load did not load; retrying via the /system/bin/lmkd bind mount' >>\"$LOG\"\n"
-            "    echo 'KSU-PHASE late-load-mount'\n"
-            "    umount -l /system/bin/lmkd 2>/dev/null\n"
-            "    if [ -e /system/bin/lmkd ] && mount --bind \"$KSUD\" /system/bin/lmkd 2>>\"$LOG\"; then\n"
-            "      /system/bin/lmkd late-load --kmi \"$KMI\" --allow-shell >>\"$LOG\" 2>&1\n"
-            "      echo \"[*] mounted late-load exit=$?\" >>\"$LOG\"\n"
-            "      umount -l /system/bin/lmkd 2>/dev/null\n"
-            "    else\n"
-            "      echo '[!] /system/bin/lmkd bind mount unavailable' >>\"$LOG\"\n"
-            "    fi\n"
+            /* Samsung DEFEX safeplace and OPlus ROOTCHECK both kill a root exec
+             * of a /data binary. Use the lmkd bind-mount path first when the
+             * vendor gate is visible; otherwise try the direct exec and fall
+             * back to the mount. ksud daemonizes, so its exit status says
+             * nothing about whether the module was loaded. */
+            "  if oem_exec_gate; then\n"
+            "    echo 'KSU-GATE vendor-exec-block mount-first'\n"
+            "    echo '[*] vendor exec gate: lmkd bind-mount path first' >>\"$LOG\"\n"
+            "    run_late_load mount\n"
+            "    LATE_LOAD_MODE=mount\n"
+            "  else\n"
+            "    run_late_load direct\n"
+            "    LATE_LOAD_MODE=direct\n"
             "  fi\n"
+            /* The daemonized grandchild has not even called init_module yet
+             * when run_late_load returns. Poll the module state (not its name)
+             * before deciding whether a retry is needed. */
+            "  KSU_NOW=$(ksu_state)\n"
+            "  for i in $(seq 1 40); do\n"
+            "    [ \"$KSU_NOW\" = Live ] && break\n"
+            "    sleep 0.1\n"
+            "    KSU_NOW=$(ksu_state)\n"
+            "  done\n"
+            "  echo \"[*] late-load poll mode=$LATE_LOAD_MODE state=$KSU_NOW attempts=$i\" >>\"$LOG\"\n"
+            /* Only an absent module means the exec itself was refused. A
+             * "Loading" entry proves the module is already being inserted, so
+             * a second late-load would just re-run the userspace half twice. */
+            "  if [ \"$KSU_NOW\" = absent ] && [ \"$LATE_LOAD_MODE\" = direct ]; then\n"
+            "    echo '[*] direct late-load inserted no module; retrying via the /system/bin/lmkd bind mount' >>\"$LOG\"\n"
+            "    run_late_load mount\n"
+            "    LATE_LOAD_MODE=mount\n"
+            "  fi\n"
+            "fi\n"
+            "if [ \"$KSU_ALREADY\" -eq 0 ]; then\n"
+            "  wait_ksu_ready\n"
+            "else\n"
+            "  KSU_STATE=Live\n"
+            "  KSU_INSTALL=1\n"
             "fi\n"
             "echo \"[*] temp su uid=$(id -u); watching kernelsu.ko\" >>\"$LOG\"\n"
             "KSU_READY=0\n"
-            "for i in $(seq 1 50); do\n"
-            "  if grep -q kernelsu /proc/modules 2>/dev/null; then KSU_READY=1; break; fi\n"
-            "  sleep 0.1\n"
-            "done\n"
+            "if [ \"$KSU_STATE\" = Live ] && [ \"$KSU_INSTALL\" -eq 1 ]; then KSU_READY=1; fi\n"
             "if [ \"$KSU_READY\" -eq 1 ]; then\n"
             "  echo '[+] KernelSU module loaded' >>\"$LOG\"\n"
+            /* ksud's userspace half (stage scripts, sepolicy rules and the
+             * manager restart) keeps running after init_module returns. Hold
+             * the root shell and the permissive window for a short settle
+             * instead of cutting them off at MODULE_STATE_COMING. */
+            "  sleep 2\n"
             "else\n"
-            "  echo '[!] KernelSU module not loaded' >>\"$LOG\"\n"
+            "  echo \"[!] KernelSU module not ready state=$KSU_STATE install=$KSU_INSTALL\" >>\"$LOG\"\n"
             "fi\n"
-            /* Dump while still permissive: after the enforcing restore the
-             * toolbox domain cannot write the app's data dir, which is why the
-             * previous build's dump silently vanished. The late-load path also
-             * dumps before the load; a module-init re-enforce can make this
-             * second dump fail, but the earlier files remain. */
+            /* The daemonized grandchild is still executing from the bind-mounted
+             * inode; detach it only after the readiness wait. The EXIT trap is
+             * the backstop for an early kill. */
+            "if [ \"$LATE_LOAD_MODE\" = mount ]; then\n"
+            "  umount -l /system/bin/lmkd 2>/dev/null\n"
+            "fi\n"
+            /* The throne tracker crowns the manager during kernelsu_init. When
+             * the APK signature does not match the module's hardened hash the
+             * manager is never crowned and no app can be granted root even
+             * though the LKM is live -- the exact "LKM works, no root" state. */
+            "KSU_MANAGER=no-evidence\n"
+            "if [ \"$NO_INSTR\" -eq 0 ]; then\n"
+            "  KSU_CROWN=$(timeout 2 dmesg 2>/dev/null | grep -E 'Crowning manager: uid=|manager uid unchanged|Found manager base.apk|Search manager finished' | tail -n 3)\n"
+            "  case \"$KSU_CROWN\" in\n"
+            "    *'Crowning manager: uid='*|*'manager uid unchanged'*) KSU_MANAGER=crowned ;;\n"
+            "    *'is_manager: 0'*) KSU_MANAGER=signature-mismatch ;;\n"
+            "    *'Found manager base.apk'*) KSU_MANAGER=found-unverified ;;\n"
+            "    *'Search manager finished'*) KSU_MANAGER=scan-done-no-crown ;;\n"
+            "  esac\n"
+            "  echo \"KSU-MANAGER $KSU_MANAGER\"\n"
+            "fi\n"
+            /* Dump after the module reached Live, so /proc/modules shows a real
+             * state instead of a transient "Loading" line. */
             "dump_debug\n"
             "DUMP_DONE=1\n"
             "if [ \"$KSU_ALREADY\" -eq 1 ]; then\n"
@@ -693,11 +778,11 @@ namespace ghostlock::attack {
              * the enforcing restore, and every dmesg read is bounded, so a
              * stuck dmesg can never hold the cleanup. */
             "if [ \"$NO_INSTR\" -eq 0 ]; then\n"
-            "  echo \"KSU-SUMMARY enforce=$(cat /sys/fs/selinux/enforce 2>/dev/null) kernelsu=$(grep -c '^kernelsu' /proc/modules 2>/dev/null) lmkd_mount=$(grep -c ' /system/bin/lmkd ' /proc/self/mountinfo 2>/dev/null) log=$LOG\"\n"
-            "  timeout 2 dmesg 2>/dev/null | command grep -i -E 'defex|kdp|rkp|kernelsu' | tail -n 15\n"
+            "  echo \"KSU-SUMMARY enforce=$(cat /sys/fs/selinux/enforce 2>/dev/null) kernelsu=$(grep -c '^kernelsu' /proc/modules 2>/dev/null) lmkd_mount=$(grep -c ' /system/bin/lmkd ' /proc/self/mountinfo 2>/dev/null) ksu_state=$KSU_STATE ksu_install=$KSU_INSTALL manager=$KSU_MANAGER log=$LOG\"\n"
+            "  timeout 2 dmesg 2>/dev/null | command grep -i -E 'defex|kdp|rkp|kernelsu|crowning manager|is_manager|search manager finished|permissive selinux' | tail -n 20\n"
             "fi\n"
             "if [ \"$KSU_READY\" -ne 1 ]; then\n"
-            "  restore_enforce ksu-not-loaded\n"
+            "  restore_enforce ksu-not-ready\n"
             "  exit 1\n"
             "fi\n"
             "else\n"

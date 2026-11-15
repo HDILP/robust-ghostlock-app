@@ -384,7 +384,11 @@ namespace ghostlock::session {
             const std::string script = config::runtime_config_snapshot().root_script_path;
             const std::string command = "sh '" + script + "'; echo DFRC=$?\n";
             if (write(shell, command.data(), command.size()) < 0) ok = false;
-            script_output = read_until(shell, 30000, "DFRC=");
+            /* The root script now waits for the module to reach Live and for
+             * ksud's userspace install before it restores enforcing, so a slow
+             * throne-tracker scan on F2FS /data can legitimately add up to
+             * ~15 s. Keep the shell read comfortably above that bound. */
+            script_output = read_until(shell, 60000, "DFRC=");
             const std::size_t marker = script_output.find("DFRC=");
             if (marker != std::string::npos && script_output.find('\n', marker) == std::string::npos) {
                 /* The marker and its digits can arrive in separate reads. */
