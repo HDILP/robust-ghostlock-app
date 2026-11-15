@@ -176,7 +176,59 @@ The buffer is raised to 32 KiB in the same change.
 
 
 
-## 4. Stage 1 — one write, verified by effect
+## 3B. Stage 0 result (2026-11-15 15:04 run): the hypothesis was wrong, twice
+
+The probe ran from the exploit's root shell (`enforce=0`, uid 0) and copied the artifacts out.
+Three of the four suspects are now eliminated, and the run itself rewrote the problem.
+
+**qsguard is not a security daemon.** Its strings are a SurfaceFlinger watchdog: `qsguard detect UI
+Freeze`, `Detect Screen freeze!! it was due to vsync timeout(%d s)`, `Request killing %u according
+to property %s`, `Request rebooting system according to property %s`, `surfaceflinger pid %d`,
+`/proc/%d/stat`. `CAP_KILL` is there to kill a hung surfaceflinger. Its single socket is an unnamed
+unix stream socket in state 01 with flags `00000000` — not even listening. **§3A's prime suspect was
+a red herring.**
+
+`vendor.dpmd` (the other uid-1000 process holding a full capability set) is Qualcomm's Data Port
+Manager — `/vendor/etc/init/vendor.dpmd.rc`, USB/tethering. Also a red herring. A scan of every
+non-root process with `CapEff & CAP_KILL` returns only `diag-router`, `vendor.dpmd`, `incidentd`,
+`qsguard`, `system_server`, `lmkd` — no security daemon among them, and logcat has no
+ActivityManager kill record for the `su` attempt.
+
+**And the run loaded KernelSU.** The drained kernel log has the whole init sequence at 77.19–77.42 s:
+`welcome to KernelSU version 32680`, `shell is allowed at init!`, `Crowning manager: uid=10357`,
+`Permissive SELinux, enforcing`. The app still reported failure, because `install=0` and the
+readiness verdict missed — a **false negative**, not a load failure.
+
+That splits the problem in two, and the second half is the one that matters:
+
+| # | Problem | Evidence |
+|---|---|---|
+| 1 | KernelSU's **userspace half never lands**: no `/data/adb/ksud`, no `/data/adb/ksu/bin/*` | `install=0`, and the install layout (`/data/adb/ksu/bin/{ksud,busybox,bootctl,resetprop}`, `/data/adb/ksu/lib/libadbroot.so`, `.ksurc`) is present in the staged ksud's own strings but none of it exists on disk |
+| 2 | Anything that *does* run `su` is killed, and a reboot follows ~15 s later | `echo id \| ksud debug su` → `Killed`, device rebooted (confirmed 15:12) |
+
+**The root shell survives all of it.** The exploit's shell runs 55 s of work as uid 0 and is never
+touched; what dies is the `ksud` daemon and the `su` path. So the useful direction is not a kernel
+patch — it is **doing KernelSU's userspace install from the root shell that already works**, which
+needs no address, no module base and no blind write.
+
+## 3C. Why the kernel-side direction is now the expensive one
+
+The same run closed every address channel the kernel-side plan depended on:
+
+| Input | Expected | Measured as uid 0 |
+|---|---|---|
+| `/proc/modules` module base | `base + static_offset` | `0x0000000000000000` for all three guard modules |
+| `/proc/kallsyms` module symbols | symbol → address | 174 `[oplus_security_guard]` symbols, **every address `0x0000000000000000`** |
+| `oplus_*.ko` on disk | offsets, section names | `/vendor/lib/modules` is root-only; `adb pull` → `Permission denied` |
+
+Without a base, a target offset and a writable-section answer, the only remaining move is a blind
+write at a guessed address on a device that reboots itself on tamper. That is not a plan; it is a
+brick risk. The direction stays on the shelf until a probe run can copy the `.ko` files out, which
+the next probe iteration does.
+
+
+
+## 4. Stage 1 — one write, verified by effect (deferred, see §3C)
 
 - Extend the profile geometry with the module-relative field offset (the profile is generated
   externally; no bundled profile matches this release, so this is an external-layer field, not a
