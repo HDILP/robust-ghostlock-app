@@ -61,7 +61,7 @@ modules and guard artifacts out of the root shell.
 | KernelSU module load | **verified-current** — loaded on the 13:10, 15:04 and 15:35 runs; the 3/6 rate was the readiness verdict, not the load |
 | Manager signature / crown | verified-current — matches, and the manager is crowned (`uid=10357`) |
 | KernelSU userspace half | **pending** — `install=0` on every run: no `/data/adb/ksud`, no `/data/adb/ksu/bin/*` |
-| Root usable by apps or shell | blocked by the in-kernel escalation check in `oplus_security_guard` |
+| Root usable by apps or shell | **reached on 2026-11-15 ~16:19, per-boot only** — by unloading `oplus_security_guard` from the root shell (`rmmod`), not by `su` surviving the detector. Operator-confirmed; the run's own `GUARD-UNLOAD` / `SU-PROBE` lines still need exporting for this record. After the 16:31 reboot both guard modules were back and `kernelsu` was absent, so nothing persists across a boot |
 
 ## Next step
 
@@ -76,6 +76,15 @@ detector**, and the chain already produces root without escalating. The open dir
 to give that existing root shell a usable command channel, not to keep pushing KernelSU's `su` path
 through a detector that is designed to catch exactly that. See
 `docs/analysis/oplus-guard-neutralisation-plan.md` §3D before reviving anything from this document.
+
+**Superseded the same day.** A shorter lever exists: the detector is a loadable module with a zero
+refcount, so `rmmod` removes it and its tracepoint registration outright — no write primitive, no
+`setuid`. On the 16:19 run that produced working root, which makes the command channel unnecessary
+for the stated goal. What it does **not** give is persistence: the vendor reloads both guard modules
+at boot, and KernelSU is still late-loaded by the exploit every time. The next step is therefore
+persistence — a KernelSU module (`post-fs-data.sh` / `service.sh` running `rmmod`) rather than a
+userspace hand-install — plus the userspace half, which should now install itself once `su` works.
+See `docs/analysis/ksu-userspace-half-plan.md`.
 
 ## Guard mechanism (measured 2026-11-15, from the modules themselves)
 

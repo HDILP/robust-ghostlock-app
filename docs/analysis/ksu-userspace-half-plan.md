@@ -150,10 +150,12 @@ batch is out of scope and must be redesigned.
 
 - [x] 批次 0 — probe implemented in `9485531`, CI `43692621460` green, APK
       `597b98ed…551cdb` installed on the device at 16:16
-- [ ] 批次 0 — **result pending**: runs at 16:17 and 16:19 produced
-      `/data/local/tmp/ghostlock-kmsg-{13696,11908}.txt`, but the `GUARD-UNLOAD` verdict goes to the
-      run's stdout, which lives in the app's private files dir. The drained kernel log does not carry
-      it, and `logcat` no longer has the run. Read it from the app's run log before recording a verdict.
-- [ ] 批次 1 — probe run and read the layout names
+- [x] 批次 0 — **root obtained with this build** (operator-confirmed 2026-11-15, the 16:19 run). No
+      third-party module was involved; the run was this APK's own `GUARD-UNLOAD` block.
+- [ ] 批次 0 — gate record needs the run's own lines: `GUARD-BEFORE …`, `GUARD-UNLOAD rc1=… rc2=…
+      after=…` and `SU-PROBE-RC=…`. They go to the run's stdout, which lives in the app's private
+      files dir; neither the drained kernel log nor `/data/local/tmp` carries them.
+- [ ] 批次 1 — probe run and read the layout names (may be moot: if `su` works, the manager installs
+      the userspace half itself)
 - [ ] 批次 2 — install block
 - [ ] 批次 3 — manager verification, gate record, device gate row flipped
