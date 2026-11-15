@@ -104,14 +104,30 @@ android {
     val keystorePwd = properties.getProperty("KEYSTORE_PASS") ?: System.getenv("KEYSTORE_PASS")
     val alias = properties.getProperty("KEY_ALIAS") ?: System.getenv("KEY_ALIAS")
     val pwd = properties.getProperty("KEY_PASSWORD") ?: System.getenv("KEY_PASSWORD")
-    val keystoreFile = keystorePath?.let(::file)?.takeIf { it.isFile && it.length() > 0L }
+    /* Every build must carry the same signature, or each artifact needs an
+     * uninstall before it can be installed over the previous one. The default
+     * debug keystore is generated per machine and per CI runner, so it never
+     * matches. When no keystore is configured -- or the configured path is
+     * missing/empty, which is what an absent SIGNING_KEY secret produces -- fall
+     * back to the keystore committed at keystore/ghostlock-ci.jks. */
+    val configuredKeystore = keystorePath?.let(::file)?.takeIf { it.isFile && it.length() > 0L }
+    val ciKeystore = project.rootProject.file("keystore/ghostlock-ci.jks")
+        .takeIf { it.isFile && it.length() > 0L }
+    val keystoreFile = configuredKeystore ?: ciKeystore
+    val usingCiKeystore = configuredKeystore == null && ciKeystore != null
+    val storePasswordValue = if (usingCiKeystore) "ghostlock-ci" else keystorePwd
+    val keyPasswordValue = if (usingCiKeystore) "ghostlock-ci" else pwd
+    val keyAliasValue = if (usingCiKeystore) "ghostlock" else alias
+    if (usingCiKeystore) {
+        logger.lifecycle("signing: no keystore configured, using keystore/${ciKeystore?.name}")
+    }
     if (keystoreFile != null) {
         signingConfigs {
             create("release") {
                 storeFile = keystoreFile
-                storePassword = keystorePwd
-                keyAlias = alias
-                keyPassword = pwd
+                storePassword = storePasswordValue
+                keyAlias = keyAliasValue
+                keyPassword = keyPasswordValue
                 enableV2Signing = true
                 enableV3Signing = true
             }

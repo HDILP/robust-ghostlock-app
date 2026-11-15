@@ -74,8 +74,8 @@ jobs:
         run: rustup toolchain link ondk "${{ runner.temp }}/ondk/toolchains/rust"
 
       - name: Decode Android signing key
-        if: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/main' }}
-        run: echo ${{ secrets.SIGNING_KEY }} | base64 -d > keystore.jks
+        if: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && secrets.SIGNING_KEY != '' }}
+        run: echo "${{ secrets.SIGNING_KEY }}" | base64 -d > keystore.jks
 
       - name: Build Ghostlock binary
         run: |
@@ -89,10 +89,15 @@ jobs:
           export ONDK_HOME="${{ runner.temp }}/ondk"
           export ANDROID_NDK_HOME="$ONDK_HOME"
           export NDK_ROOT="$ONDK_HOME"
-          export KEYSTORE_PATH="../keystore.jks"
-          export KEYSTORE_PASS="${{ secrets.KEY_STORE_PASSWORD }}"
-          export KEY_ALIAS="${{ secrets.ALIAS }}"
-          export KEY_PASSWORD="${{ secrets.KEY_PASSWORD }}"
+          # Only point the build at a decoded key when one actually exists;
+          # otherwise the committed keystore/ghostlock-ci.jks is used and every
+          # artifact keeps the same signature.
+          if [ -s keystore.jks ]; then
+            export KEYSTORE_PATH="../keystore.jks"
+            export KEYSTORE_PASS="${{ secrets.KEY_STORE_PASSWORD }}"
+            export KEY_ALIAS="${{ secrets.ALIAS }}"
+            export KEY_PASSWORD="${{ secrets.KEY_PASSWORD }}"
+          fi
           ./gradlew :app:assembleRelease --no-daemon
 
       - name: Strip Ghostlock binary
