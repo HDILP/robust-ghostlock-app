@@ -153,14 +153,14 @@ batch is out of scope and must be redesigned.
 - [x] 批次 0 — **unload verified**: run `20261115-164233` logs
       `GUARD-UNLOAD rc1=0 rc2=0 before=2 after=0` with `cap=000001ffffffffff`,
       `modules_disabled=0`. Both modules really left `/proc/modules`.
-- [ ] 批次 0 — **`su` after an unload is still unproven.** The 16:42 run unloaded the guard but its
-      late-load failed (`seen=absent`, no `KernelSU: welcome`), so `su=absent` and the app's
-      `RESULT=FAIL` is accurate about KernelSU — not a false negative. The 16:19 run reached
-      `KernelSU: welcome` and unloaded the same modules, but its stdout log was not captured.
-- [ ] 批次 0b — **move the unload after `wait_ksu_ready`** so a single run can hold "KernelSU up" and
-      "detector gone" at once, making `SU-PROBE` a real test. Running it before the late-load leaves
-      the two conditions in different runs.
-- [ ] 批次 1 — probe run and read the layout names (may be moot: if `su` works, the manager installs
-      the userspace half itself)
-- [ ] 批次 2 — install block
-- [ ] 批次 3 — manager verification, gate record, device gate row flipped
+- [x] 批次 1 / 批次 2 — **dropped, they were solving a problem that solved itself.** With the guard
+      gone, KernelSU's own late-load completed the userspace half during the same run:
+      `/data/adb/ksud`, `/data/adb/ksu/bin/{ksud,busybox,bootctl,resetprop}` and
+      `/data/adb/ksu/lib/libadbroot.so`, all stamped 16:43. Hand-installing it was never needed.
+- [x] 批次 3 — verified after the run: `adb shell su -c id` → `uid=0 context=u:r:ksu:s0`; the manager
+      grants apps root (MT Manager).
+- [ ] 批次 4 — **the run verdict is a false negative and must move before the enforcing flip.** The
+      16:42 run reported `RESULT=FAIL` while doing everything right, because `seen` / `install` / `su`
+      and the kernel-log drain all fail in the same window. See the gate record's table.
+- [ ] 批次 5 — persistence: a KernelSU module running `rmmod oplus_security_guard` in
+      `post-fs-data.sh` / `service.sh`, now that modules can actually run.

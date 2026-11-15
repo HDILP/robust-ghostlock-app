@@ -140,11 +140,15 @@ python3 tools/cmp_disasm.py <baseline-binary> build/native/ghostlock
 
 ## 排障
 
-- **KernelSU 交接的判定不要用 `/proc/modules`。** `kernelsu_init` 结尾执行 `setenforce(true)`，
-  之后 root shell 域读不到 `/proc/modules` 也读不到 `dmesg`，模块可见窗口只有约 0.2 s。
-  就绪判定用 drain 到 `/data/local/tmp` 的内核日志里的 `KernelSU: welcome`（或 `Crowning manager`）。
-  **`install=1` 不是加载判据**：本机 `install=0` 时模块照样加载并 crown（15:04 实测），
-  `/data/adb/ksud` 从未出现过，`seen=absent` 可以是假阴性。
+- **KernelSU 交接的判定，四个信号在翻转后同时失效。** `kernelsu_init` 结尾执行 `setenforce(true)`，
+  之后 root shell（`u:r:oppo_shell:s0`）读不到 `/proc/modules`、读不到 `dmesg`、`ls /data/adb` 被拒，
+  连它自己的 drain 写入都失败（`can't create …txt.new: Permission denied`）。于是 `seen=absent`、
+  `install=0`、`su=absent` 三个检查一起报假阴性，内核日志也停在翻转前。
+  **2026-11-15 16:42 那跑是活样本**：`KSU-READY seen=absent boot=0 install=0 attempts=60 su=absent`，
+  app 因此判 `RESULT=FAIL`；而同一开机的设备状态是 `su -c id` → `uid=0 context=u:r:ksu:s0`、
+  `/data/adb/ksud` + `/data/adb/ksu/bin/{ksud,busybox,bootctl,resetprop}` + `ksu/lib/libadbroot.so`
+  全在、管理器已把 root 发给 app。**判定必须在翻转之前算，或者换成能活过翻转的通道**；
+  多加几个检查项没用——它们依赖的是同一份、已经失去的权限。
 - **`ksud late-load` 会 double-fork 守护化**，父进程在模块插入前就返回 0，退出码不能当加载结果。
 - **OPlus 系内核按路径拒绝 `/data` 下的 root exec**（`ROOTCHECK execve_block`，并留下
   `preempt_count 1`）。走 `/system/bin/lmkd` bind mount；`oplus_sepolicy_reload` 之后还有一段

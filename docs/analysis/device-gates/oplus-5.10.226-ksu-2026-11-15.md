@@ -58,11 +58,11 @@ modules and guard artifacts out of the root shell.
 | Surface | State |
 |---|---|
 | Exploit chain (W1 + DirtyFrag) | verified-current on this build |
-| KernelSU module load | **verified-current** — loaded on the 13:10, 15:04 and 15:35 runs; the 3/6 rate was the readiness verdict, not the load |
+| KernelSU module load | **verified-current** — loaded on the 13:10, 15:04, 15:35 and 16:42 runs; the 3/6 rate was the readiness verdict, not the load |
 | Manager signature / crown | verified-current — matches, and the manager is crowned (`uid=10357`) |
-| KernelSU userspace half | **pending** — `install=0` on every run: no `/data/adb/ksud`, no `/data/adb/ksu/bin/*` |
+| KernelSU userspace half | **verified-current** — installed during the 16:42 run: `/data/adb/ksud`, `/data/adb/ksu/bin/{ksud,busybox,bootctl,resetprop}`, `/data/adb/ksu/lib/libadbroot.so`, all stamped 16:43. Every earlier `install=0` was the verdict failing to read `/data/adb`, not the install failing |
 | Guard neutralisation by unload | **verified-current** — `GUARD-UNLOAD rc1=0 rc2=0 before=2 after=0` on the 16:42 run; `delete_module` needs no write primitive and no setuid |
-| Root usable by apps or shell | **pending** — needs one run that both loads KernelSU and unloads the guard; no readable log has both yet. The uid 0 seen on the device is the exploit's own shell, not a granted `su` |
+| Root usable by apps or shell | **verified-current** — `adb shell su -c id` → `uid=0 … context=u:r:ksu:s0`, and the manager grants apps root (MT Manager). Per boot only: the vendor reloads both guard modules at the next boot and KernelSU still has to be late-loaded by the exploit |
 
 ## Next step
 
@@ -80,13 +80,16 @@ through a detector that is designed to catch exactly that. See
 
 **Superseded the same day.** A shorter lever exists: the detector is a loadable module with a zero
 refcount, so `rmmod` removes it and its tracepoint registration outright — no write primitive, no
-`setuid`. Verified on the 16:42 run (`rc1=0 rc2=0 before=2 after=0`). Combined with the root shell the
-chain already has, that makes a separate command channel unnecessary: the shell plus a guard-free
-kernel *is* the channel. What is still unproven is `su` being granted to apps, and what it does **not**
-give is persistence: the vendor reloads both guard modules at boot, and KernelSU is still late-loaded
-by the exploit every time. The next step is therefore to unload **after** KernelSU is ready, then make
-it survive a reboot from a KernelSU module (`post-fs-data.sh` / `service.sh`) rather than by
-hand-installing the userspace half.
+`setuid`. Verified on the 16:42 run (`rc1=0 rc2=0 before=2 after=0`), and the run's own aftermath
+shows the full chain: `su` granted in `u:r:ksu:s0`, apps rooted, userspace half installed. A separate
+command channel is therefore unnecessary — the shell plus a guard-free kernel *is* the channel — and so
+is the hand-install of `/data/adb`.
+
+What it does **not** give is persistence. The vendor reloads both guard modules at boot and KernelSU is
+still late-loaded by the exploit every time, so root dies with the reboot. The next step is a KernelSU
+module that runs `rmmod` in `post-fs-data.sh` / `service.sh`, which is now possible precisely because
+the userspace half exists. The other open item is the verdict itself: it has to stop reporting failure
+after a run that worked, which means computing it before the enforcing flip (see the table above).
 
 ## Guard mechanism (measured 2026-11-15, from the modules themselves)
 
@@ -137,7 +140,7 @@ removes the whole module and its tracepoint registration.
 installs cleanly, reports success, and does nothing. A module that says it worked is not evidence;
 only `/proc/modules` losing the entry is.
 
-### Guard unload — the run whose log carries the verdict (2026-11-15 16:42)
+### Guard unload — the run that removed the detector (2026-11-15 16:42)
 
 Run folder `20261115-164233` (nine device runs before it; this is the ninth-plus, exported by the app
 because `run-as` is unavailable on a release build):
@@ -152,26 +155,43 @@ Both guard modules left `/proc/modules` with no error, with all capabilities pre
 outright, and `delete_module` needs neither a write primitive nor `setuid` — the part §3D never
 covered, because it only asked whether the *check* could be edited.
 
-The same run still ends `RESULT=FAIL script=1 enforce=1`, and that verdict is **correct, not a false
-negative**. `KSU-READY seen=absent boot=0 install=0 attempts=60 su=absent`, and the drained kernel log
-has no `KernelSU: welcome` and no `Crowning manager`; `su` exists nowhere on the device. The uid 0
-that was observed is the **exploit's own root shell** (`u:r:oppo_shell:s0`), which has been uid 0 on
-every run since the chain first worked — it says nothing about KernelSU, and nothing about apps
-getting root.
+**The app's `RESULT=FAIL` on that run was a false negative.** Measured afterwards on the same boot
+(uptime 1059 s), with the run long finished:
 
-Two measurements keep this from being misread:
+```
+$ adb shell su -c id
+uid=0(root) gid=0(root) groups=0(root) context=u:r:ksu:s0
+$ grep -cE '^oplus_(security_guard|secure_harden) ' /proc/modules
+0
+$ ls -la /data/adb/ksu/bin            # all created 16:43, during that run
+ksud -> /data/adb/ksud   busybox   bootctl   resetprop
+$ ls -la /data/adb/ksu/lib
+libadbroot.so
+```
 
-- The late-load failure is the already-documented one, not a side effect of the unload. The kill window
-  after the policy reload has no fixed length; this run made three `KSU-ATTEMPT`s, all `seen=absent`.
-  The 16:19 run unloaded the same two modules and *did* reach `KernelSU: welcome`.
-- Every write the script makes after the enforcing flip is denied — `can't create
-  /data/local/tmp/…txt.new`, `can't create /sys/fs/selinux/enforce`, `ls /data/adb: Permission denied`.
-  That is the script's own documented ordering constraint (dumps before the flip), not a new failure.
+That run unloaded the detector, KernelSU loaded and stayed live, `su` was granted in `u:r:ksu:s0` —
+the correct domain, not the exploit's `oppo_shell` — the manager passed it on to apps (MT Manager ran
+with full root), and **the userspace half installed itself**: the exact thing that had been
+`install=0` for nine runs. The first reading of this log took `seen=absent` at face value and
+concluded the opposite; the device state is what settled it.
 
-**Ordering consequence.** The unload currently runs *before* the late-load. That means no run so far
-has both "KernelSU up" and "guard gone" with a readable log, so `su` working after an unload is still
-unproven. The unload belongs after `wait_ksu_ready`: load KernelSU exactly as the proven runs do, then
-remove the detector, then let `SU-PROBE` become a real test of `su`.
+**Why the verdict lies, structurally.** Every readiness signal needs root access the shell loses at the
+enforcing flip, so none of them is evidence once the flip has happened:
+
+| Signal | Why it is unreadable at check time |
+|---|---|
+| `seen=absent` from `/proc/modules` | after `setenforce(true)` `oppo_shell` cannot read `/proc/modules` at all |
+| `install=0` from `/data/adb/ksud` | the same run's own `ADB-DUMP` prints `ls: /data/adb: Permission denied` |
+| `su=absent` from `/data/adb/ksu/bin/su` | same directory, same denial |
+| the drained kernel log | the drain's writes fail too — `can't create …txt.new: Permission denied` — so `kmsg-live.txt` stops 22 s before the interesting part and carries no `KernelSU: welcome` |
+
+This is the trap `AGENTS.md` already records for `/proc/modules`, one step further: `install` and `su`
+are not independent evidence either, and "check more carefully" cannot fix it. The verdict has to be
+computed **before** the flip, or through something that survives it.
+
+**Ordering is not the defect.** Unloading before the late-load is what let KernelSU's `su` work in the
+same run. An earlier revision of this section called for moving the unload after `wait_ksu_ready`;
+that is withdrawn. What needs to move is the verdict, not the unload.
 
 ## Verification entry
 
