@@ -142,14 +142,29 @@ python3 tools/cmp_disasm.py <baseline-binary> build/native/ghostlock
 
 - **KernelSU 交接的判定不要用 `/proc/modules`。** `kernelsu_init` 结尾执行 `setenforce(true)`，
   之后 root shell 域读不到 `/proc/modules` 也读不到 `dmesg`，模块可见窗口只有约 0.2 s。
-  就绪判定用 drain 到 `/data/local/tmp` 的内核日志里的 `KernelSU: welcome`，或 `/data/adb/ksud`。
+  就绪判定用 drain 到 `/data/local/tmp` 的内核日志里的 `KernelSU: welcome`（或 `Crowning manager`）。
+  **`install=1` 不是加载判据**：本机 `install=0` 时模块照样加载并 crown（15:04 实测），
+  `/data/adb/ksud` 从未出现过，`seen=absent` 可以是假阴性。
 - **`ksud late-load` 会 double-fork 守护化**，父进程在模块插入前就返回 0，退出码不能当加载结果。
 - **OPlus 系内核按路径拒绝 `/data` 下的 root exec**（`ROOTCHECK execve_block`，并留下
   `preempt_count 1`）。走 `/system/bin/lmkd` bind mount；`oplus_sepolicy_reload` 之后还有一段
   长度不固定的杀进程窗口，重试要留余量。
-- **OPlus 的 `oplus_security_guard` 按进程杀 root**：`su` 与 `/data/local/tmp/ksud debug su`
-  都会被拦并触发 15 s 自动重启。该设备上 root 不可用是这一层造成的，不是 KernelSU 配置问题；
-  证据与结论见 `docs/analysis/device-gates/oplus-5.10.226-ksu-2026-11-15.md`。
+- **杀 root 的是内核，不是任何用户态守护。** `oplus_security_guard` 在 sys_exit tracepoint 里判
+  「保存的 uid 是否小于 `cred->uid`」，命中就 `oplus_root_killed`（`.text+0x388`）打
+  `Kill the process of escalation...` 并发 SIGKILL。**门是「凭据提升」（setuid/setreuid/setresuid
+  一族），不是「是不是 root」**——所以 exploit 的 root shell 能连跑 55 s，而 `su` 与
+  `ksud debug su` 毫秒级被杀、约 15 s 后重启。别再把这些入口的失败归因于 KernelSU 配置。
+- **弹窗只是门面。** 「已阻止破坏行为」由 `com.oplus.exsystemservice`
+  （`/system_ext/priv-app/OplusExSystemService`，uid 1000，**`CapEff=0`**）画，它没有杀进程的能力。
+  `qsguard`（高通 SurfaceFlinger 看门狗）与 `vendor.dpmd`（数据端口管理器）都不是安全守护，
+  别再当嫌疑人。
+- **内核侧打补丁这条路已经证伪，别再走。** 现有写原语只有「零写」和「低字节 `0x00` 的指针写」，
+  而守护的早退标志 `g_boot_state` 在 `.data..ro_after_init`、钩子计数是立即数、`.data` 里的
+  两个 hook 数组全 `.text` 没有间接跳转去读、判定逻辑本身是 `.rodata` 跳表 + 内联代码。
+  推理链见 `docs/analysis/oplus-guard-neutralisation-plan.md` §3D。
+- **地址对 uid 0 也是关的**：`/proc/modules` 的模块基址全是 `0x0`，`/proc/kallsyms` 的模块符号
+  地址也全是 `0x0`，`/vendor/lib/modules` 与 `/sys/module/*/sections/*` 只有 root 能读。要拿到
+  厂商模块就在 root shell 里 `cp` 出来（`guard_probe` 已经这么做），不要在用户态找基址。
 - Gradle native 构建找不到 NDK：设 `ANDROID_NDK_HOME` / `ANDROID_NDK_ROOT` 或
   `local.properties` 的 `ndk.dir`。
 - Rust 交叉编译 Android：必须用 rustup 工具链的 `rustc`（Homebrew rustc 缺

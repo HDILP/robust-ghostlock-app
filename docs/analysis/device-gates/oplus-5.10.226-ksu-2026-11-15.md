@@ -1,7 +1,8 @@
 # OPlus 5.10.226 KernelSU handoff — device gate (2026-11-15) — chain PASS, root BLOCKED
 
-Branch `main` @ `9b0251e` (this fork's own line, not `document`). Six device runs, logs archived in
-the app's run folders `20261115-095715` … `20261115-140030`.
+Branch `main` @ `94880fd` (this fork's own line, not `document`). Nine device runs across
+`20261115-095715` … `20261115-153500`; the last three were driven by the in-app probe stage
+(`guard_probe`), which copies the vendor modules and guard artifacts out of the root shell.
 
 ## Device and entry
 
@@ -41,32 +42,72 @@ the app's run folders `20261115-095715` … `20261115-140030`.
    `setenforce(true)`; from that moment `oppo_shell` cannot read `/proc/modules` or `dmesg`, and the
    module is visible for only ~0.2 s. Readiness comes from the drained kernel log
    (`KernelSU: welcome`) or `/data/adb/ksud`. `/data/local/tmp` stays writable across the flip.
-4. **The vendor guard blocks root at the process level, not at execve.** `adb shell su -c id`
-   returns `Killed` (SIGKILL, not `execve_block`), and opening the manager raises the vendor's
-   "已阻止破坏行为" prompt. `ksud debug su` (which grants root through `KSU_IOCTL_GRANT_ROOT` and
-   then execs `sh`, never executing anything named `su`) is also caught: the system reports a
-   malicious app breaking the system and reboots after 15 s.
+4. **The kill is in-kernel, and it fires on credential escalation, not on being root.**
+   `adb shell su -c id` returns `Killed` (SIGKILL, not `execve_block`); `ksud debug su` (which grants
+   root through `KSU_IOCTL_GRANT_ROOT` and execs `sh`, never executing anything named `su`) is also
+   caught, and the device reboots ~15 s later. Measured 2026-11-15: `oplus_root_killed`
+   (`.text+0x388` in `oplus_security_guard.ko`) prints `Kill the process of escalation...` and issues
+   SIGKILL from the sys_exit tracepoint handler, whose gate is a saved-uid-vs-`cred->uid` comparison
+   followed by a jump table over syscalls 143–214 — the `setuid`/`setreuid`/`setresuid` family.
+   The exploit's root shell never calls one of those, which is why it runs a full 55 s of work as
+   uid 0 while every `su` entry point dies in milliseconds.
 
 ## Status
 
 | Surface | State |
 |---|---|
 | Exploit chain (W1 + DirtyFrag) | verified-current on this build |
-| KernelSU module load | pending — flaky, 3/6 runs |
-| Manager signature / crown | verified-current — matches, not the blocker |
-| Root usable by apps or shell | blocked by `oplus_security_guard` |
+| KernelSU module load | **verified-current** — loaded on the 13:10, 15:04 and 15:35 runs; the 3/6 rate was the readiness verdict, not the load |
+| Manager signature / crown | verified-current — matches, and the manager is crowned (`uid=10357`) |
+| KernelSU userspace half | **pending** — `install=0` on every run: no `/data/adb/ksud`, no `/data/adb/ksu/bin/*` |
+| Root usable by apps or shell | blocked by the in-kernel escalation check in `oplus_security_guard` |
 
 ## Next step
 
-The guard has to go before any root is usable, and disabling it needs the privilege it denies. The
-exploit already yields `uid=0` plus an arbitrary kernel write primitive, so the only coherent
-direction is a **kernel-side** neutralisation of the guard's execve hook from inside the existing
-chain — not more userspace work in the handoff. A userspace-only path would have to survive a guard
-that kills by process, and every userspace entry point tested so far is caught.
+The kernel-side direction recorded here on 2026-11-15 is **withdrawn**:
+`docs/analysis/oplus-guard-neutralisation-plan.md` §3D shows the chain's write primitive (zero write,
+or a pointer write with a `0x00` low byte) cannot reach the check — the early-exit flag is in
+`.data..ro_after_init`, the hook count is an immediate, the `.data` hook arrays are never called, and
+the decision itself is code.
+
+What the modules establish instead is the shape of the problem: the guard is an **escalation
+detector**, and the chain already produces root without escalating. The open direction is therefore
+to give that existing root shell a usable command channel, not to keep pushing KernelSU's `su` path
+through a detector that is designed to catch exactly that. See
+`docs/analysis/oplus-guard-neutralisation-plan.md` §3D before reviving anything from this document.
+
+## Guard mechanism (measured 2026-11-15, from the modules themselves)
+
+`/vendor/lib/modules` is root-only, so these were copied out by the run's own root shell. Fingerprints
+are recorded here so a future run can tell whether the vendor modules changed:
+
+| File | SHA-256 |
+|---|---|
+| `oplus_security_guard.ko` (31,872 B) | `a02a5321ee73b5479a7341fd6f45c24d361cce5f8b82fae98c0c21bd73e22ece` |
+| `oplus_secure_harden.ko` (31,032 B) | `a18bea37cbe5e5eb6e80a5aa9f1b7ca167fcfbe743c7be9be6221d8c61c3cfe4` |
+| `oplus_security_keventupload.ko` (16,080 B) | `1f9e122e72f8d00f0c0aac4177f003c38fd2c684a1c860cd7ad44906d0982386` |
+| `/system_ext/bin/qsguard` (70,192 B) | `855cde24696500327690c7bf4d25fa22d83d04b74c9bf39d6c67592f20eed516` |
+
+- `oplus_security_guard.ko` keeps its `.symtab`: `oplus_root_killed` `.text+0x388`,
+  `oplus_root_check_post_handler` `.text+0x3e8`, `g_boot_state` `.data..ro_after_init+0x0`,
+  `oplus_pre_hook_array` `.data+0x10`, `oplus_post_hook_array` `.data+0x40`.
+- The block dialog is drawn by `com.oplus.exsystemservice`
+  (`/system_ext/priv-app/OplusExSystemService`), uid 1000, `u:r:system_app:s0`, **`CapEff=0`**, and
+  contains `antirootdialog/OplusAntiRootDialogService`. It is the face of the block, not its
+  mechanism: it has no capability to kill anything.
+- `qsguard` is **not** a security daemon. It is Qualcomm's SurfaceFlinger watchdog (`qsguard detect UI
+  Freeze`, `Detect Screen freeze!! ... vsync timeout`); its `CAP_KILL` exists to kill a hung
+  surfaceflinger. `vendor.dpmd` is Qualcomm's Data Port Manager. Both were suspects and are cleared.
+- Address sources are all closed even for uid 0: `/proc/modules` reports every module base as
+  `0x0`, `/proc/kallsyms` lists 174 `[oplus_security_guard]` symbols with every address `0x0`, and
+  `/sys/module/*/sections/*` is root-only.
 
 ## Verification entry
 
 Reproduce with the app's normal run, then read `KSU-SUMMARY` in the run log: `seen` / `boot` /
 `install` / `manager` / `attempts`, followed by `KSU-DMESG` (drained kernel log tail) and
-`KSU-MGRSIGN` (manager certificate). A run that never reaches `install=1` did not load the module and
-proves nothing about root.
+`KSU-MGRSIGN` (manager certificate). Judge the load from `KernelSU: welcome` in the drained kernel
+log, **not** from `install=1` — `install` tracks the userspace half, which this build never completes.
+A run whose `KSU-SUMMARY` says `seen=absent` can still have loaded and crowned the module; the 15:04
+run did.
+

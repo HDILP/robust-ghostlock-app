@@ -3,7 +3,7 @@
 Status: **closed — premise disproved.** The decision recorded here (kernel-side, not another round
 of late-load reliability work) was correct about the kill being in-kernel, and wrong about it being
 reachable: §3D shows the write primitive cannot touch the check. The useful outcome is the diagnosis
-in §3D, not a patch. Read §3B–§3D before reviving any of §4.
+in §3D, not a patch. Read §3B–§3D before reviving any of §4–§7.
 
 Branch `main` @ `f7eea73`. Input: `docs/analysis/device-gates/oplus-5.10.226-ksu-2026-11-15.md`
 (six device runs, `20261115-095715` … `20261115-140030`).
@@ -129,6 +129,10 @@ lines — read-back only, no write. This proves the computed target lands in the
 before anything is written to it.
 
 ## 3A. Stage 0 evidence collected over adb (2026-11-15, no root)
+
+> **Superseded by §3B — kept as the record of what the hypothesis was.** Everything measured here is
+> still true; the conclusion drawn from it (qsguard as the killer) is not. Read §3B before using
+> anything in this section.
 
 Read-only recon on the device itself (`PJJ110`, same build). Four facts, one of which changes the
 shape of the question:
