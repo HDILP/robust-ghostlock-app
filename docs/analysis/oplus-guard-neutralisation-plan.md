@@ -1,8 +1,9 @@
 # OPlus `oplus_security_guard` neutralisation — plan (2026-11-15)
 
-Status: **for operator approval.** Decision taken here: **kernel-side, not another round of
-late-load reliability work.** Stage 0 is a read-only feasibility gate that runs before any new
-native code; Stage 1 is one write through the existing primitive.
+Status: **closed — premise disproved.** The decision recorded here (kernel-side, not another round
+of late-load reliability work) was correct about the kill being in-kernel, and wrong about it being
+reachable: §3D shows the write primitive cannot touch the check. The useful outcome is the diagnosis
+in §3D, not a patch. Read §3B–§3D before reviving any of §4.
 
 Branch `main` @ `f7eea73`. Input: `docs/analysis/device-gates/oplus-5.10.226-ksu-2026-11-15.md`
 (six device runs, `20261115-095715` … `20261115-140030`).
@@ -228,7 +229,51 @@ the next probe iteration does.
 
 
 
-## 4. Stage 1 — one write, verified by effect (deferred, see §3C)
+## 3D. Verdict (2026-11-15, from the module itself): the write primitive cannot reach it
+
+The second probe run copied the three guard modules out (`/vendor/lib/modules` is root-only), and the
+`.ko` answers the question the plan was built on. **The kill is in-kernel, and it is not reachable by
+a data write.**
+
+`oplus_security_guard.ko` (31,872 B) carries `.symtab`, so every offset below is exact:
+
+| Symbol | Section | Offset | Note |
+|---|---|---|---|
+| `oplus_root_killed` | `.text` | `0x388` (0x24) | `printk("Kill the process of escalation...")` then `mov w0,#9` + call — the SIGKILL |
+| `oplus_root_check_post_handler` | `.text` | `0x3e8` (0xcc) | the sys_exit tracepoint body |
+| `g_boot_state` | `.data..ro_after_init` | `0x0` (1 B) | `tbnz w9,#0 → return`: the only early exit |
+| `oplus_pre_hook_array` | `.data` | `0x10` (6 × 8 B) | writable |
+| `oplus_post_hook_array` | `.data` | `0x40` (6 × 8 B) | writable |
+| `oplus_get_pre_hook_num` | `.text` | `0x104` | `mov w0,#2` — the count is an **immediate**, not a data word |
+
+Four levers, all dead:
+
+1. **The early-exit flag is read-only.** `g_boot_state` lives in `.data..ro_after_init`; a write there
+   faults, and a fault in a tracepoint is a panic on a device that already reboots on tamper.
+2. **The hook count cannot be zeroed** — `oplus_get_pre_hook_num` returns the constant 2.
+3. **The hook arrays are inert.** A full scan of `.text` finds exactly two indirect branches in the
+   whole module (`0x488`, the syscall jump table; `0xa20`), and **neither reads the hook arrays**.
+   Zeroing a slot would change nothing.
+4. **The decision is inline code.** `oplus_root_check_post_handler` compares the saved uid against
+   `cred->uid`, then dispatches through a jump table over syscalls `143..214` — `setuid`/`setreuid`/
+   `setresuid` and friends. The jump table is in `.rodata`, and the primitive cannot write code.
+
+So the plan's central premise is wrong: a zero-write or a low-byte-`0x00` pointer write cannot
+disable this check. Reaching it needs a *code* write (or a call into `set_memory_rw`), which the
+chain does not have and which this plan explicitly excluded.
+
+**What the module does tell us is more useful than a patch would have been.** The check fires on
+**credential escalation** — a syscall that raises uid — not on "being root". The exploit's root shell
+is already uid 0 without ever calling one of those syscalls, which is exactly why it runs 55 s of work
+untouched while `ksud debug su` dies in milliseconds. The guard is an escalation detector, and the
+existing chain already sidesteps it.
+
+That reframes the product question: what is missing is not root, it is a **way to use the root the
+chain already has**. KernelSU's `su` path is an escalation by construction and will always trip this
+detector on this build. The direction worth pursuing is a root command channel on the existing shell,
+not a fight with the module.
+
+## 4. Stage 1 — one write, verified by effect (withdrawn, see §3D)
 
 - Extend the profile geometry with the module-relative field offset (the profile is generated
   externally; no bundled profile matches this release, so this is an external-layer field, not a
