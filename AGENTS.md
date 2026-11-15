@@ -140,6 +140,16 @@ python3 tools/cmp_disasm.py <baseline-binary> build/native/ghostlock
 
 ## 排障
 
+- **KernelSU 交接的判定不要用 `/proc/modules`。** `kernelsu_init` 结尾执行 `setenforce(true)`，
+  之后 root shell 域读不到 `/proc/modules` 也读不到 `dmesg`，模块可见窗口只有约 0.2 s。
+  就绪判定用 drain 到 `/data/local/tmp` 的内核日志里的 `KernelSU: welcome`，或 `/data/adb/ksud`。
+- **`ksud late-load` 会 double-fork 守护化**，父进程在模块插入前就返回 0，退出码不能当加载结果。
+- **OPlus 系内核按路径拒绝 `/data` 下的 root exec**（`ROOTCHECK execve_block`，并留下
+  `preempt_count 1`）。走 `/system/bin/lmkd` bind mount；`oplus_sepolicy_reload` 之后还有一段
+  长度不固定的杀进程窗口，重试要留余量。
+- **OPlus 的 `oplus_security_guard` 按进程杀 root**：`su` 与 `/data/local/tmp/ksud debug su`
+  都会被拦并触发 15 s 自动重启。该设备上 root 不可用是这一层造成的，不是 KernelSU 配置问题；
+  证据与结论见 `docs/analysis/device-gates/oplus-5.10.226-ksu-2026-11-15.md`。
 - Gradle native 构建找不到 NDK：设 `ANDROID_NDK_HOME` / `ANDROID_NDK_ROOT` 或
   `local.properties` 的 `ndk.dir`。
 - Rust 交叉编译 Android：必须用 rustup 工具链的 `rustc`（Homebrew rustc 缺
