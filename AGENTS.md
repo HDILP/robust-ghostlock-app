@@ -162,6 +162,23 @@ python3 tools/cmp_disasm.py <baseline-binary> build/native/ghostlock
   而守护的早退标志 `g_boot_state` 在 `.data..ro_after_init`、钩子计数是立即数、`.data` 里的
   两个 hook 数组全 `.text` 没有间接跳转去读、判定逻辑本身是 `.rodata` 跳表 + 内联代码。
   推理链见 `docs/analysis/oplus-guard-neutralisation-plan.md` §3D。
+- **「打补丁」证伪不等于「卸载」证伪。** 上一条说的是现有写原语改不动**检查逻辑**；`delete_module`
+  是完全不同的一条杠杆，不需要写原语、不碰 setuid。2026-11-15 实测本机
+  `grep -iE 'guard|harden' /proc/modules`：只有 `oplus_security_guard`（refcount **0**）、
+  `oplus_secure_harden`（refcount 1，**由前者持有**，所以必须先卸前者否则 `EBUSY`）、
+  `oplus_security_keventupload`、`oplusboot`；系统自带 `/system/bin/rmmod`（toybox）。
+  `rmmod` 只需 `CAP_SYS_MODULE`，init_cred 本来就有，W1 之后又是 permissive。
+  root 脚本里已内置 `GUARD-UNLOAD` 探针（`NO_INSTR` 门控），判定看运行日志的
+  `GUARD-BEFORE count=… cap=… modules_disabled=…` 与 `GUARD-UNLOAD rc1=… rc2=… after=…`。
+- **模块名对不上等于空操作——第三方「卸 guard」模块在本机是假的。** 流传的
+  `unload_oplus_secure_guard_new` 打的是 `oplus_secure_guard_new`（新版 ColorOS 的
+  `[secureguard_new][root_check]`，拦「真实 uid≠0 执行 `/data/adb/**`」）。本机**没有**这个模块，
+  它的 `loaded()` 恒为假，只会打印 "already unloaded, nothing to do" 并退出——**装了、点了执行、
+  显示正常，等于什么也没做**。看到它报成功不能当作 guard 已解除的证据，唯一判据是
+  `/proc/modules` 里模块真的消失。
+- **卸载只在当次开机有效。** 模块由 vendor 在开机时重新加载：2026-11-15 16:31 重启后
+  `oplus_security_guard` / `oplus_secure_harden` 都在，而 `kernelsu` 不在列表里（KSU 始终靠 exploit
+  晚加载）。要跨重启就得靠 KSU 模块或 init 阶段，不要指望 `rmmod` 持久。
 - **地址对 uid 0 也是关的**：`/proc/modules` 的模块基址全是 `0x0`，`/proc/kallsyms` 的模块符号
   地址也全是 `0x0`，`/vendor/lib/modules` 与 `/sys/module/*/sections/*` 只有 root 能读。要拿到
   厂商模块就在 root shell 里 `cp` 出来（`guard_probe` 已经这么做），不要在用户态找基址。

@@ -277,6 +277,14 @@ chain already has**. KernelSU's `su` path is an escalation by construction and w
 detector on this build. The direction worth pursuing is a root command channel on the existing shell,
 not a fight with the module.
 
+**Addendum (2026-11-15, after §3D was written).** §3D closes one lever, not all of them: it shows the
+write primitive cannot change the *check*. It says nothing about removing the module that carries it.
+On this device `oplus_security_guard` has refcount 0 and `oplus_secure_harden` is held only by it, so
+`delete_module` — which needs `CAP_SYS_MODULE` and no write at all — is a separate candidate. The
+`GUARD-UNLOAD` probe in the root script measures it; verdict in
+`docs/analysis/ksu-userspace-half-plan.md`. Do not read this section's "withdrawn" as "the guard
+cannot be neutralised".
+
 ## 4. Stage 1 — one write, verified by effect (withdrawn, see §3D)
 
 - Extend the profile geometry with the module-relative field offset (the profile is generated

@@ -148,7 +148,12 @@ batch is out of scope and must be redesigned.
 
 ## 进度
 
-- [ ] 批次 0 — guard unload probe (code in `ops.cpp`, awaiting one device run)
+- [x] 批次 0 — probe implemented in `9485531`, CI `43692621460` green, APK
+      `597b98ed…551cdb` installed on the device at 16:16
+- [ ] 批次 0 — **result pending**: runs at 16:17 and 16:19 produced
+      `/data/local/tmp/ghostlock-kmsg-{13696,11908}.txt`, but the `GUARD-UNLOAD` verdict goes to the
+      run's stdout, which lives in the app's private files dir. The drained kernel log does not carry
+      it, and `logcat` no longer has the run. Read it from the app's run log before recording a verdict.
 - [ ] 批次 1 — probe run and read the layout names
 - [ ] 批次 2 — install block
 - [ ] 批次 3 — manager verification, gate record, device gate row flipped

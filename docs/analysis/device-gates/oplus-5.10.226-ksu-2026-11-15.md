@@ -103,6 +103,29 @@ are recorded here so a future run can tell whether the vendor modules changed:
   `0x0`, `/proc/kallsyms` lists 174 `[oplus_security_guard]` symbols with every address `0x0`, and
   `/sys/module/*/sections/*` is root-only.
 
+### The guard set on this device, and a module that does not match it
+
+Measured 2026-11-15 16:32 from `adb shell`, after a reboot (uptime 98 s):
+
+| Module | Refcount | Held by |
+|---|---|---|
+| `oplus_security_guard` | 0 | — |
+| `oplus_secure_harden` | 1 | `oplus_security_guard` |
+| `oplus_security_keventupload` | 2 | `oplus_security_guard`, `oplus_secure_harden` |
+| `oplusboot` | 7 | the guard set plus `qcom_q6v5_pas`, `dump_device_info`, … |
+
+`/system/bin/rmmod` exists (toybox). The zero refcount means `delete_module` can remove
+`oplus_security_guard` outright, and only then `oplus_secure_harden` — the reverse order is `EBUSY`.
+That lever is unrelated to §3D: §3D shows the write primitive cannot change the *check*, while unloading
+removes the whole module and its tracepoint registration.
+
+**Trap.** The widely circulated KernelSU module `unload_oplus_secure_guard_new` targets
+`oplus_secure_guard_new` — the newer ColorOS module that blocks non-root exec of `/data/adb/**`
+(`[secureguard_new][root_check] … execve_block`). **This device does not have that module.** Its
+`loaded()` grep is therefore always false, it prints "already unloaded, nothing to do" and exits: it
+installs cleanly, reports success, and does nothing. A module that says it worked is not evidence;
+only `/proc/modules` losing the entry is.
+
 ## Verification entry
 
 Reproduce with the app's normal run, then read `KSU-SUMMARY` in the run log: `seen` / `boot` /
