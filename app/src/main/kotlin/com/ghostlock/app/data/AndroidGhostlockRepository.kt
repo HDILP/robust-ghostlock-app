@@ -37,6 +37,7 @@ import com.ghostlock.app.domain.model.ProfileDiffRow
 import com.ghostlock.app.domain.model.RunLogEntry
 import com.ghostlock.app.domain.model.RootManagerCandidate
 import com.ghostlock.app.domain.model.RunLogState
+import com.ghostlock.app.domain.model.RunVerdict
 import com.ghostlock.app.domain.model.StrideCandidateOption
 import com.ghostlock.app.domain.model.StrideProbe
 import com.ghostlock.app.domain.model.UserProfileFile
@@ -1472,8 +1473,16 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
                 )
                 onLog("<b> native exited code=$nativeCode")
                 if (pipeline == "dirtyfrag" && nativeCode == 0) {
-                    onLog("<b> pipeline=dirtyfrag: W1 done; starting the DirtyFrag stage")
-                    runDirtyfragStage(onLog, debugDir)
+                    val nativeOutput = runCatching {
+                        nativeLog.readText(StandardCharsets.UTF_8)
+                    }.getOrDefault("")
+                    if (RunVerdict.isAlreadyRootedSkip(nativeOutput)) {
+                        onLog("<b> pipeline=dirtyfrag: KernelSU already has root; skipping DirtyFrag stage")
+                        0
+                    } else {
+                        onLog("<b> pipeline=dirtyfrag: W1 done; starting the DirtyFrag stage")
+                        runDirtyfragStage(onLog, debugDir)
+                    }
                 } else {
                     nativeCode
                 }
