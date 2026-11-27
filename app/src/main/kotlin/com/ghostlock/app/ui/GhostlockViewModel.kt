@@ -1164,6 +1164,22 @@ class GhostlockViewModel(
                     showPreflightNotice(preflight.failure)
                     return@launch
                 }
+                PreflightResult.AlreadyRootedThisBoot -> {
+                    /* A run already ended rooted this boot: the exploit and the
+                     * late-load are spent. Record the skip in the run log so
+                     * the sheet and the notification say already-rooted instead
+                     * of re-running W1. */
+                    if (!beginOperation()) return@launch
+                    mutableState.update { it.copy(runStatus = RunStatus.Running) }
+                    appendLog("==== start ${if (useShizuku) "Shizuku/V20" else "base"} ====")
+                    appendLog("cpu pair: $pairLabel")
+                    appendLog("KernelSU already has root this boot; exploit skipped")
+                    appendLog("result: already rooted (exploit skipped)")
+                    appendLog("exit code=0")
+                    finishRunStatus(0, 0)
+                    endOperation()
+                    return@launch
+                }
                 PreflightResult.Passed -> Unit
             }
             if (!beginOperation()) return@launch
@@ -1221,6 +1237,10 @@ class GhostlockViewModel(
         mutableState.update {
             it.copy(runStatus = if (rooted) RunStatus.Success else RunStatus.Failure)
         }
+        /* A rooted verdict is this boot's proof: the next Run must skip instead
+         * of re-walking spent anchor slots (2026-11-26: two redundant W1 rounds
+         * followed a clean RESULT=OK). Cleared by reboot via the boot id. */
+        if (rooted) repository.markRootedThisBoot()
         RunStatusService.finish(application, message, rooted)
         /* The page-free W1's value is a kernel address, so it sets the two
          * policycap bytes at selinux_state+5/+6. The post-root policy load
