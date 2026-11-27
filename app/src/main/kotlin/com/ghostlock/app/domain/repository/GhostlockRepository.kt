@@ -235,6 +235,14 @@ interface GhostlockRepository {
     suspend fun preflight(pair: CpuPair, useShizuku: Boolean): PreflightResult
 
     /**
+     * Record a rooted verdict for this boot. The next [preflight] returns
+     * [com.ghostlock.app.domain.model.PreflightResult.AlreadyRootedThisBoot]
+     * until the device reboots (the marker carries the boot id), so a second
+     * Run skips the exploit instead of re-walking spent anchor slots.
+     */
+    fun markRootedThisBoot()
+
+    /**
      * The step left `in_progress` by the previous run (usually a kernel panic),
      * or null when the last run completed/failed cleanly. `w3*` means Shizuku
      * (shell uid, no seccomp) can skip that stage.

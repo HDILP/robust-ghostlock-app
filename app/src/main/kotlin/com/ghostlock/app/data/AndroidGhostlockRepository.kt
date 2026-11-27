@@ -37,6 +37,7 @@ import com.ghostlock.app.domain.model.ProfileDiffRow
 import com.ghostlock.app.domain.model.RunLogEntry
 import com.ghostlock.app.domain.model.RootManagerCandidate
 import com.ghostlock.app.domain.model.RunLogState
+import com.ghostlock.app.domain.model.RunVerdict
 import com.ghostlock.app.domain.model.StrideCandidateOption
 import com.ghostlock.app.domain.model.StrideProbe
 import com.ghostlock.app.domain.model.UserProfileFile
@@ -117,6 +118,13 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
          * The direct path's home is filesDir; the Shizuku service's is
          * /data/local/tmp/ghostlock-app, outside the app sandbox. */
         const val AnchorStateFileName = ".ghostlock_anchor"
+
+        /* Written after a run whose verdict is ROOTED_*: "<boot-id>\n". The
+         * pre-flight turns a same-boot marker into AlreadyRootedThisBoot, so a
+         * second Run on an already-rooted boot skips the exploit instead of
+         * re-walking spent anchor slots. A reboot changes the boot id and the
+         * marker stops matching. */
+        const val RootedBootMarkerFileName = ".ghostlock_rooted_boot"
 
         /* A pre-flight manager choice is reused only this soon, and only while
          * the chosen binary still exists. */
@@ -793,6 +801,11 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
 
     override suspend fun preflight(pair: CpuPair, useShizuku: Boolean): PreflightResult =
         withContext(Dispatchers.IO) {
+            /* A marker whose boot id matches this boot proves a run already
+             * ended rooted here; the exploit, the late-load and this boot's
+             * anchor budget are all spent. Independent of the su channel,
+             * which stays blind for an unauthorized app domain. */
+            if (rootedThisBoot()) return@withContext PreflightResult.AlreadyRootedThisBoot
             /* The anchor state file lives under GHOSTLOCK_HOME, and the CPU pin
              * runs in the native's process: for the Shizuku path that home is
              * /data/local/tmp/ghostlock-app and the process is the shell's, so
@@ -824,6 +837,27 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
      * failure, or null when a slot can be handed out (or there is no anchor to
      * check here).
      */
+    private fun rootedThisBoot(): Boolean {
+        val marker = runCatching {
+            File(filesDir, RootedBootMarkerFileName).readText().trim()
+        }.getOrNull().orEmpty()
+        if (marker.isEmpty()) return false
+        val bootId = runCatching {
+            File("/proc/sys/kernel/random/boot_id").readText().trim()
+        }.getOrNull().orEmpty()
+        return bootId.isNotEmpty() && marker == bootId
+    }
+
+    /** Record this boot as rooted; consumed by the next run's pre-flight. */
+    override fun markRootedThisBoot() {
+        runCatching {
+            val bootId = File("/proc/sys/kernel/random/boot_id").readText().trim()
+            if (bootId.isNotEmpty()) {
+                File(filesDir, RootedBootMarkerFileName).writeText(bootId + "\n")
+            }
+        }
+    }
+
     private suspend fun anchorFailure(pair: CpuPair): PreflightFailure? {
         val config = runCatching { profileController.load(deviceRelease(), pair) }.getOrNull()
             ?: return null
@@ -1471,12 +1505,20 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
                     onProcess = { processRef.set(it) },
                 )
                 onLog("<b> native exited code=$nativeCode")
+                var finalCode = nativeCode
                 if (pipeline == "dirtyfrag" && nativeCode == 0) {
-                    onLog("<b> pipeline=dirtyfrag: W1 done; starting the DirtyFrag stage")
-                    runDirtyfragStage(onLog, debugDir)
-                } else {
-                    nativeCode
+                    val nativeOutput = runCatching {
+                        nativeLog.readText(StandardCharsets.UTF_8)
+                    }.getOrDefault("")
+                    if (RunVerdict.isAlreadyRootedSkip(nativeOutput)) {
+                        onLog("<b> pipeline=dirtyfrag: KernelSU already has root; skipping DirtyFrag stage")
+                        finalCode = 0
+                    } else {
+                        onLog("<b> pipeline=dirtyfrag: W1 done; starting the DirtyFrag stage")
+                        finalCode = runDirtyfragStage(onLog, debugDir)
+                    }
                 }
+                finalCode
             } finally {
                 withContext(Dispatchers.IO) {
                     tailer.interrupt()

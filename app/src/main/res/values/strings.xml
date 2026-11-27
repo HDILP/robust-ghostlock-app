@@ -414,6 +414,7 @@
     <string name="run_notif_success_title">Root active</string>
     <string name="run_notif_success_text_ghostlock">KernelSU loaded and SELinux restored.</string>
     <string name="run_notif_success_text_dirtyfrag">Root shell obtained; page cache restored.</string>
+    <string name="run_notif_already_rooted_text">KernelSU already has root; exploit skipped.</string>
     <string name="run_notif_failure_title">Run finished</string>
     <string name="run_notif_failure_text">Root was not obtained. Open the app for the log.</string>
     <string name="reboot_recommended_title">Reboot recommended</string>

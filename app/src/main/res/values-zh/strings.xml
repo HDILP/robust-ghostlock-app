@@ -413,6 +413,7 @@
     <string name="run_notif_success_title">Root 已就绪</string>
     <string name="run_notif_success_text_ghostlock">KernelSU 已加载，SELinux 已恢复。</string>
     <string name="run_notif_success_text_dirtyfrag">已获得 root shell，页缓存已恢复。</string>
+    <string name="run_notif_already_rooted_text">KernelSU 已拥有 root 权限，已跳过提权。</string>
     <string name="run_notif_failure_title">运行结束</string>
     <string name="run_notif_failure_text">未获得 root。打开应用查看日志。</string>
     <string name="reboot_recommended_title">建议重启</string>

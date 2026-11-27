@@ -28,5 +28,11 @@ enum class PreflightFailure {
 sealed interface PreflightResult {
     data object Passed : PreflightResult
 
+    /** This boot already ended a run with a rooted verdict: the exploit and
+     * the late-load are proven spent, so a second run would only re-walk the
+     * anchor slots (measured 2026-11-26: two extra W1 rounds after a clean
+     * RESULT=OK). The marker carries the boot id, so a reboot clears it. */
+    data object AlreadyRootedThisBoot : PreflightResult
+
     data class Blocked(val failure: PreflightFailure) : PreflightResult
 }

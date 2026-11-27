@@ -37,6 +37,7 @@ import com.ghostlock.app.domain.model.nextPhysImage
 import com.ghostlock.app.domain.model.sourceSuppliesLoad
 import com.ghostlock.app.domain.model.ProfileDiffRow
 import com.ghostlock.app.domain.model.RunLogEntry
+import com.ghostlock.app.domain.model.RunVerdict
 import com.ghostlock.app.domain.model.ProfileFieldNode
 import com.ghostlock.app.domain.model.RouteVerdict
 import com.ghostlock.app.domain.model.ShizukuStatus
@@ -1163,6 +1164,22 @@ class GhostlockViewModel(
                     showPreflightNotice(preflight.failure)
                     return@launch
                 }
+                PreflightResult.AlreadyRootedThisBoot -> {
+                    /* A run already ended rooted this boot: the exploit and the
+                     * late-load are spent. Record the skip in the run log so
+                     * the sheet and the notification say already-rooted instead
+                     * of re-running W1. */
+                    if (!beginOperation()) return@launch
+                    mutableState.update { it.copy(runStatus = RunStatus.Running) }
+                    appendLog("==== start ${if (useShizuku) "Shizuku/V20" else "base"} ====")
+                    appendLog("cpu pair: $pairLabel")
+                    appendLog("KernelSU already has root this boot; exploit skipped")
+                    appendLog("result: already rooted (exploit skipped)")
+                    appendLog("exit code=0")
+                    finishRunStatus(0, 0)
+                    endOperation()
+                    return@launch
+                }
                 PreflightResult.Passed -> Unit
             }
             if (!beginOperation()) return@launch
@@ -1175,16 +1192,28 @@ class GhostlockViewModel(
                 application,
                 application.getString(R.string.run_notif_running_text),
             )
+            val runStartIndex = mutableState.value.logLines.size
             appendLog("==== start ${if (useShizuku) "Shizuku/V20" else "base"} ====")
             appendLog("cpu pair: $pairLabel")
             withContext(Dispatchers.IO) {
                 try {
                     val code = runExploitUseCase(pair, useShizuku, ::appendLog)
-                    appendLog(if (code == 0) "result: exploit completed" else "result: exploit failed (exit code=$code)")
+                    val runText = mutableState.value.logLines.drop(runStartIndex).joinToString("\n") { it.text }
+                    val outcome = RunVerdict.classify(runText, code)
+                    appendLog(
+                        when (outcome) {
+                            RunVerdict.Outcome.ALREADY_ROOTED -> "result: already rooted (exploit skipped)"
+                            RunVerdict.Outcome.ROOTED_GHOSTLOCK,
+                            RunVerdict.Outcome.ROOTED_DIRTYFRAG,
+                            -> "result: exploit completed"
+                            RunVerdict.Outcome.FAILED ->
+                                if (code == 0) "result: exploit completed" else "result: exploit failed (exit code=$code)"
+                        },
+                    )
                     appendLog("exit code=$code")
-                    finishRunStatus(code)
+                    finishRunStatus(code, runStartIndex)
                 } finally {
-                    if (mutableState.value.runStatus == RunStatus.Running) finishRunStatus(-1)
+                    if (mutableState.value.runStatus == RunStatus.Running) finishRunStatus(-1, runStartIndex)
                     endOperation()
                     send(GhostlockEffect.KeepScreenAwake(false))
                 }
@@ -1193,20 +1222,25 @@ class GhostlockViewModel(
     }
 
     /** Terminal run status for the sheet footer and the result notification. */
-    private fun finishRunStatus(code: Int) {
-        val text = mutableState.value.logLines.joinToString("\n") { it.text }
-        val dirtyfrag = text.contains("pipeline=dirtyfrag")
-        val rooted = code == 0 && (text.contains("KernelSU ready") || text.contains("RESULT=OK"))
+    private fun finishRunStatus(code: Int, runStartIndex: Int) {
+        val text = mutableState.value.logLines.drop(runStartIndex).joinToString("\n") { it.text }
+        val outcome = RunVerdict.classify(text, code)
+        val rooted = outcome.isRooted
         val message = application.getString(
-            when {
-                rooted && dirtyfrag -> R.string.run_notif_success_text_dirtyfrag
-                rooted -> R.string.run_notif_success_text_ghostlock
-                else -> R.string.run_notif_failure_text
+            when (outcome) {
+                RunVerdict.Outcome.ROOTED_DIRTYFRAG -> R.string.run_notif_success_text_dirtyfrag
+                RunVerdict.Outcome.ROOTED_GHOSTLOCK -> R.string.run_notif_success_text_ghostlock
+                RunVerdict.Outcome.ALREADY_ROOTED -> R.string.run_notif_already_rooted_text
+                RunVerdict.Outcome.FAILED -> R.string.run_notif_failure_text
             },
         )
         mutableState.update {
             it.copy(runStatus = if (rooted) RunStatus.Success else RunStatus.Failure)
         }
+        /* A rooted verdict is this boot's proof: the next Run must skip instead
+         * of re-walking spent anchor slots (2026-11-26: two redundant W1 rounds
+         * followed a clean RESULT=OK). Cleared by reboot via the boot id. */
+        if (rooted) repository.markRootedThisBoot()
         RunStatusService.finish(application, message, rooted)
         /* The page-free W1's value is a kernel address, so it sets the two
          * policycap bytes at selinux_state+5/+6. The post-root policy load
