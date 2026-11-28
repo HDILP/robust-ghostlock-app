@@ -28,13 +28,7 @@ namespace ghostlock::session {
         uint32_t log_poll_interval_ms = 500;
     };
 
-    /* State token (field 5) of a /proc/modules line; empty when absent.
-     * Exposed as a pure function so the poll can be host-tested. */
-    [[nodiscard]] std::string_view module_state(std::string_view line) noexcept;
-
-    /* /proc/modules scan for the kernelsu entry. A "Loading" entry is
-     * MODULE_STATE_COMING: init_module() has inserted the module but
-     * kernelsu_init() has not finished, so su is not usable yet. */
+    /* /proc/modules scan for the kernelsu entry. */
     bool kernelsu_module_visible() noexcept;
 
     /* True when KernelSU already grants root here (su -c 'id -u' == 0).

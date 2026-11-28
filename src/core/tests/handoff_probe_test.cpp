@@ -42,16 +42,6 @@ namespace {
 } // namespace
 
 int32_t main(void) {
-    /* The 5.10.226 OPlus dump captured "Loading": the old name-only check
-     * reported the module as ready before kernelsu_init() finished. */
-    using ghostlock::session::module_state;
-    assert(module_state("kernelsu 303104 2 - Loading 0x0000000000000000 (O+)") == "Loading");
-    assert(module_state("kernelsu 303104 2 - Live 0x0000000000000000 (O+)") == "Live");
-    assert(module_state("kernelsu 303104 2 - Unloading 0x0 (O+)") == "Unloading");
-    assert(module_state("msm_drm 4227072 17 - Live 0x0 (O)") == "Live");
-    assert(module_state("kernelsu 303104 2 - ").empty());
-    assert(module_state("short line").empty());
-
     bool loaded = false;
     bool failed = false;
     assert(!ghostlock::session::scan_ksu_log("/nonexistent/.ghostlock_ksu.log",

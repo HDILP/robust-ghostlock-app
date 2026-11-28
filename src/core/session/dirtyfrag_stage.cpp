@@ -384,11 +384,7 @@ namespace ghostlock::session {
             const std::string script = config::runtime_config_snapshot().root_script_path;
             const std::string command = "sh '" + script + "'; echo DFRC=$?\n";
             if (write(shell, command.data(), command.size()) < 0) ok = false;
-            /* The root script retries the late-load three times with widening
-             * gaps and then waits for readiness, so the failure path legitimately
-             * takes ~40 s (a slow throne-tracker scan on F2FS /data adds more).
-             * Keep the shell read comfortably above that bound. */
-            script_output = read_until(shell, 90000, "DFRC=");
+            script_output = read_until(shell, 30000, "DFRC=");
             const std::size_t marker = script_output.find("DFRC=");
             if (marker != std::string::npos && script_output.find('\n', marker) == std::string::npos) {
                 /* The marker and its digits can arrive in separate reads. */
