@@ -202,3 +202,19 @@ log, **not** from `install=1` — `install` tracks the userspace half, which thi
 A run whose `KSU-SUMMARY` says `seen=absent` can still have loaded and crowned the module; the 15:04
 run did.
 
+## 2026-11-28 — code reverted, the unload promoted to the product path
+
+The branch went back to the r11 mainline (`76e10067`) for everything that judged or retried the
+KernelSU handoff: the ready-state poll over the drained kernel log, the widened late-load retries,
+the staging of a su-free entry, and the probe stage (`guard_probe`, `GUARD-BEFORE`). Only the
+load-bearing lever survives, and it leaves the instrumentation gate: `write_root_script()` now
+unloads `oplus_security_guard` and then `oplus_secure_harden` unconditionally — present-only,
+non-fatal, before the policy fixup and the late-load — logging
+`GUARD-UNLOAD md=… before=… rc1=… rc2=… after=…`.
+
+What that changes in the rows above: the unload result stands (it is what made `su` work), the
+KernelSU load and the userspace half stand, and the run-local verdict is back to the mainline one —
+still `RESULT=FAIL` on a run that worked, for the reason in "Why the verdict lies". The verdict was
+deliberately left alone in this revert. Judge this device from `su -c id`, `/proc/modules` and
+`/data/adb`, not from the run log's bottom line.
+

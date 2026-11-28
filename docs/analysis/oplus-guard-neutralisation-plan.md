@@ -5,6 +5,12 @@ of late-load reliability work) was correct about the kill being in-kernel, and w
 reachable: §3D shows the write primitive cannot touch the check. The useful outcome is the diagnosis
 in §3D, not a patch. Read §3B–§3D before reviving any of §4–§7.
 
+Status update (2026-11-28): the branch is back on the r11 mainline for the code this plan and its
+successors added, and the one lever that worked — the unload in the §3D addendum — is now
+unconditional product code in `write_root_script()` (`GUARD-UNLOAD`). The patch direction (§3D) stays
+closed; the probe stages and the reliability batches are gone. See
+`docs/analysis/device-gates/oplus-5.10.226-ksu-2026-11-15.md`, last section.
+
 Branch `main` @ `f7eea73`. Input: `docs/analysis/device-gates/oplus-5.10.226-ksu-2026-11-15.md`
 (six device runs, `20261115-095715` … `20261115-140030`).
 
@@ -281,9 +287,9 @@ not a fight with the module.
 write primitive cannot change the *check*. It says nothing about removing the module that carries it.
 On this device `oplus_security_guard` has refcount 0 and `oplus_secure_harden` is held only by it, so
 `delete_module` — which needs `CAP_SYS_MODULE` and no write at all — is a separate candidate. The
-`GUARD-UNLOAD` probe in the root script measures it; verdict in
-`docs/analysis/ksu-userspace-half-plan.md`. Do not read this section's "withdrawn" as "the guard
-cannot be neutralised".
+unload is now product code in the root script (2026-11-28); verdict in
+`docs/analysis/device-gates/oplus-5.10.226-ksu-2026-11-15.md`. Do not read this section's
+"withdrawn" as "the guard cannot be neutralised".
 
 ## 4. Stage 1 — one write, verified by effect (withdrawn, see §3D)
 

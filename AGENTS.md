@@ -140,15 +140,18 @@ python3 tools/cmp_disasm.py <baseline-binary> build/native/ghostlock
 
 ## 排障
 
-- **KernelSU 交接的判定，四个信号在翻转后同时失效。** `kernelsu_init` 结尾执行 `setenforce(true)`，
+- **KernelSU 交接的判定，翻转后同时失效。** `kernelsu_init` 结尾执行 `setenforce(true)`，
   之后 root shell（`u:r:oppo_shell:s0`）读不到 `/proc/modules`、读不到 `dmesg`、`ls /data/adb` 被拒，
-  连它自己的 drain 写入都失败（`can't create …txt.new: Permission denied`）。于是 `seen=absent`、
-  `install=0`、`su=absent` 三个检查一起报假阴性，内核日志也停在翻转前。
-  **2026-11-15 16:42 那跑是活样本**：`KSU-READY seen=absent boot=0 install=0 attempts=60 su=absent`，
-  app 因此判 `RESULT=FAIL`；而同一开机的设备状态是 `su -c id` → `uid=0 context=u:r:ksu:s0`、
-  `/data/adb/ksud` + `/data/adb/ksu/bin/{ksud,busybox,bootctl,resetprop}` + `ksu/lib/libadbroot.so`
-  全在、管理器已把 root 发给 app。**判定必须在翻转之前算，或者换成能活过翻转的通道**；
-  多加几个检查项没用——它们依赖的是同一份、已经失去的权限。
+  连它自己的 drain 写入都失败（`can't create …txt.new: Permission denied`）。于是收尾的
+  `grep -c '^kernelsu' /proc/modules`（日志里 `KSU-SUMMARY … kernelsu=0`）、`/data/adb/ksud`
+  与 `su` 三项一起报假阴性，内核日志也停在翻转前。
+  **2026-11-15 16:42 那跑是活样本**：日志里 `kernelsu=0`、`[!] KernelSU module not loaded`，
+  脚本以 `DFRC=1` 退出、app 判 `RESULT=FAIL`；而同一开机的设备状态是 `su -c id` →
+  `uid=0 context=u:r:ksu:s0`、`/data/adb/ksud` + `/data/adb/ksu/bin/{ksud,busybox,bootctl,resetprop}`
+  + `ksu/lib/libadbroot.so` 全在、管理器已把 root 发给 app。**判定必须在翻转之前算，或者换成能活过
+  翻转的通道**；多加几个检查项没用——它们依赖的是同一份、已经失去的权限。
+  **当前 native 侧就是主线这套判定（未修）**，所以「日志报失败、设备上 root 可用」是常态：
+  看设备状态，不要把 `DFRC`/`RESULT=FAIL` 当结论。
 - **`ksud late-load` 会 double-fork 守护化**，父进程在模块插入前就返回 0，退出码不能当加载结果。
 - **OPlus 系内核按路径拒绝 `/data` 下的 root exec**（`ROOTCHECK execve_block`，并留下
   `preempt_count 1`）。走 `/system/bin/lmkd` bind mount；`oplus_sepolicy_reload` 之后还有一段
@@ -166,14 +169,17 @@ python3 tools/cmp_disasm.py <baseline-binary> build/native/ghostlock
   而守护的早退标志 `g_boot_state` 在 `.data..ro_after_init`、钩子计数是立即数、`.data` 里的
   两个 hook 数组全 `.text` 没有间接跳转去读、判定逻辑本身是 `.rodata` 跳表 + 内联代码。
   推理链见 `docs/analysis/oplus-guard-neutralisation-plan.md` §3D。
-- **「打补丁」证伪不等于「卸载」证伪。** 上一条说的是现有写原语改不动**检查逻辑**；`delete_module`
-  是完全不同的一条杠杆，不需要写原语、不碰 setuid。2026-11-15 实测本机
+- **「打补丁」证伪不等于「卸载」证伪——卸载就是正解。** 上一条说的是现有写原语改不动**检查逻辑**；
+  `delete_module` 是完全不同的一条杠杆，不需要写原语、不碰 setuid。2026-11-15 实测本机
   `grep -iE 'guard|harden' /proc/modules`：只有 `oplus_security_guard`（refcount **0**）、
   `oplus_secure_harden`（refcount 1，**由前者持有**，所以必须先卸前者否则 `EBUSY`）、
   `oplus_security_keventupload`、`oplusboot`；系统自带 `/system/bin/rmmod`（toybox）。
   `rmmod` 只需 `CAP_SYS_MODULE`，init_cred 本来就有，W1 之后又是 permissive。
-  root 脚本里已内置 `GUARD-UNLOAD` 探针（`NO_INSTR` 门控），判定看运行日志的
-  `GUARD-BEFORE count=… cap=… modules_disabled=…` 与 `GUARD-UNLOAD rc1=… rc2=… after=…`。
+  **root 脚本现在无条件卸这两个模块**（`write_root_script()` 里 `GUARD-UNLOAD` 段，位置在 policy
+  fixup 与 KSU late-load 之前，`oplus_security_guard` 先、`oplus_secure_harden` 后）：
+  只在 `/proc/modules` 里确实存在时执行，其他厂商等于空操作，失败不致命。
+  判据是日志 `GUARD-UNLOAD md=… before=… rc1=… rc2=… after=…`，`after=0` 才算卸掉。
+  卸掉之后同一跑的 `su` 才活得下来——16:42 那跑的 `uid=0 context=u:r:ksu:s0` 就是卸载之后的。
 - **模块名对不上等于空操作——第三方「卸 guard」模块在本机是假的。** 流传的
   `unload_oplus_secure_guard_new` 打的是 `oplus_secure_guard_new`（新版 ColorOS 的
   `[secureguard_new][root_check]`，拦「真实 uid≠0 执行 `/data/adb/**`」）。本机**没有**这个模块，
@@ -185,7 +191,7 @@ python3 tools/cmp_disasm.py <baseline-binary> build/native/ghostlock
   晚加载）。要跨重启就得靠 KSU 模块或 init 阶段，不要指望 `rmmod` 持久。
 - **地址对 uid 0 也是关的**：`/proc/modules` 的模块基址全是 `0x0`，`/proc/kallsyms` 的模块符号
   地址也全是 `0x0`，`/vendor/lib/modules` 与 `/sys/module/*/sections/*` 只有 root 能读。要拿到
-  厂商模块就在 root shell 里 `cp` 出来（`guard_probe` 已经这么做），不要在用户态找基址。
+  厂商模块就在 root shell 里 `cp` 出来，不要在用户态找基址。
 - Gradle native 构建找不到 NDK：设 `ANDROID_NDK_HOME` / `ANDROID_NDK_ROOT` 或
   `local.properties` 的 `ndk.dir`。
 - Rust 交叉编译 Android：必须用 rustup 工具链的 `rustc`（Homebrew rustc 缺

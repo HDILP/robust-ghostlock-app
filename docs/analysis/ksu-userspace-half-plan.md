@@ -4,6 +4,15 @@ Status: **proposed; batch 1 not yet run.** L-level (the generated root script is
 content). No change to the route, the payload, the profile schema, the wire format, the Kotlin
 contract, or the eight attack functions.
 
+Status update (2026-11-28): **withdrawn — nothing here is implemented.** The branch went back to the
+r11 mainline (`76e10067`) for the readiness poll, the widened late-load retries and the probe stage
+this plan grew out of. The load-bearing change was not in this plan at all: unloading
+`oplus_security_guard` from the root shell removes the detector that kills `su`, so the userspace half
+installs itself during a normal run. The unload is now unconditional product code in
+`write_root_script()`; see `docs/analysis/oplus-guard-neutralisation-plan.md` header and the last
+section of `docs/analysis/device-gates/oplus-5.10.226-ksu-2026-11-15.md`. The body below is kept as
+the record of the detour.
+
 ## 现状与基线
 
 - Branch `main` @ `48bb94f`. Device `PJJ110`, `5.10.226-android12-9-o-gbf90590695a1`.

