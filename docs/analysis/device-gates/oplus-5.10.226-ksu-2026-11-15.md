@@ -1,4 +1,4 @@
-# OPlus 5.10.226 KernelSU handoff — device gate (2026-11-15) — chain PASS, root BLOCKED
+# OPlus 5.10.226 KernelSU handoff — device gate (2026-11-15) — chain PASS, root granted once the guard is unloaded
 
 Branch `main` @ `24f0e1c` (this fork's own line, not `document`). Eight device runs on 2026-11-15: the
 first six are archived in the app's run folders `20261115-095715` … `20261115-140030`, and the last
